@@ -365,14 +365,16 @@ func (r *rateLimiter) take(ctx context.Context) error {
 // ---- crawler ----
 
 type stats struct {
-	fetched     atomic.Int64
-	shortReads  atomic.Int64
-	parsed      atomic.Int64
-	typeSkip    atomic.Int64
-	parseErrors atomic.Int64
-	inserted    atomic.Int64
-	retries     atomic.Int64
-	failed      atomic.Int64
+	fetched         atomic.Int64
+	shortReads      atomic.Int64
+	parsed          atomic.Int64
+	typeSkip        atomic.Int64
+	parseErrors     atomic.Int64
+	inserted        atomic.Int64
+	retries         atomic.Int64
+	failed          atomic.Int64
+	verifyMismatch  atomic.Int64
+	verifyDiffShown atomic.Int64
 }
 
 type groupResult struct {
@@ -402,6 +404,7 @@ var (
 	flagTmpIP        = flag.Bool("tmpip", false, "Rotate source IPv6 across all Devices in /etc/tmpiprest.conf")
 	flagTmpIPConf    = flag.String("tmpip-conf", "/etc/tmpiprest.conf", "tmpiprest config path (used with -tmpip)")
 	flagSrc6PerReq   = flag.Bool("src6-per-request", false, "New source IP per request instead of per connection (slower: TLS per request)")
+	flagVerify       = flag.Bool("verify", false, "Differential-test fastRow against the full parser per entry; log mismatches")
 	flagProgress     = flag.Duration("progress-every", 30*time.Second, "Progress log interval")
 	flagCHDSN        = flag.String("clickhouse-dsn", "", "ClickHouse host:port, e.g. '127.0.0.1:9000'")
 	flagCHDB         = flag.String("clickhouse-database", "certstream", "ClickHouse database")
@@ -616,30 +619,46 @@ func processGroup(ctx context.Context, g interval, jsonClient *client.LogClient,
 				return
 			}
 		}
-		entry, parseErr := certificatetransparency.ParseCertstreamEntry(rawLogEntry, "certcrawler", "certcrawler", *flagLog, logType)
-		if parseErr != nil {
-			st.parseErrors.Add(1)
+		isPrecert := hasType && leafType == ct.PrecertLogEntryType
+		if *flagVerify {
+			verifyEntry(rawLogEntry, isPrecert, idx, st, *flagLog, logType, *flagTiled)
 			return
 		}
-		// parser hardcodes X509LogEntry - the caller (watcher/crawler) sets the real type
-		if hasType && leafType == ct.PrecertLogEntryType {
-			entry.Data.UpdateType = "PrecertLogEntry"
+		if chConn == nil && *flagQuiet {
+			return // no output sink configured - nothing to emit
 		}
-		if !*flagAsDER {
-			entry.Data.LeafCert.AsDER = ""
-			for i := range entry.Data.Chain {
-				entry.Data.Chain[i].AsDER = ""
-			}
-		}
-		st.parsed.Add(1)
+		// fast path for ClickHouse rows: DER-walk the leaf only, no full
+		// x509.ParseCertificate, no chain handling.
 		if chConn != nil {
-			rows = append(rows, reformatCertFields(&entry.Data))
+			row, ferr := fastRow(rawLogEntry, isPrecert, idx, *flagLog, *flagTiled)
+			if ferr != nil {
+				st.parseErrors.Add(1)
+				return
+			}
+			rows = append(rows, *row)
 		}
+		// full slim parse only needed for stdout JSON output
 		if !*flagQuiet {
+			entry, parseErr := certificatetransparency.ParseCertstreamEntrySlim(rawLogEntry, "certcrawler", "certcrawler", *flagLog, logType)
+			if parseErr != nil {
+				st.parseErrors.Add(1)
+				return
+			}
+			// parser hardcodes X509LogEntry - the caller (watcher/crawler) sets the real type
+			if isPrecert {
+				entry.Data.UpdateType = "PrecertLogEntry"
+			}
+			if !*flagAsDER {
+				entry.Data.LeafCert.AsDER = ""
+				for i := range entry.Data.Chain {
+					entry.Data.Chain[i].AsDER = ""
+				}
+			}
 			if line, marshalErr := json.Marshal(entry); marshalErr == nil {
 				lines = append(lines, string(line))
 			}
 		}
+		st.parsed.Add(1)
 	}
 
 	if *flagTiled {
@@ -1065,8 +1084,8 @@ func main() {
 	}
 
 	if allDone || done.covered() == totalSpan {
-		log.Printf("crawl complete: %d entries covered, inserted=%d typeSkipped=%d parseErrs=%d",
-			done.covered(), st.inserted.Load(), st.typeSkip.Load(), st.parseErrors.Load())
+		log.Printf("crawl complete: %d entries covered, inserted=%d typeSkipped=%d parseErrs=%d verifyMismatch=%d",
+			done.covered(), st.inserted.Load(), st.typeSkip.Load(), st.parseErrors.Load(), st.verifyMismatch.Load())
 	} else {
 		remaining := totalSpan - done.covered()
 		log.Printf("crawl finished with %d entries still uncovered (state in %s) - rerun to retry",
