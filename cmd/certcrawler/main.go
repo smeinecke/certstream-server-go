@@ -462,7 +462,17 @@ func fetchWithRetry(ctx context.Context, jsonClient *client.LogClient, limiter *
 	return nil, lastErr
 }
 
+// bounds concurrent ClickHouse batches - group completions arrive in waves and
+// an unbounded burst exhausts the driver conn pool (acquire conn timeout)
+var insertSem = make(chan struct{}, 24)
+
 func insertWithRetry(ctx context.Context, chConn clickhouse.Conn, db, table string, rows []CertificateRow, st *stats, group interval) error {
+	select {
+	case insertSem <- struct{}{}:
+		defer func() { <-insertSem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	delay := 500 * time.Millisecond
 	var lastErr error
 	// deterministic dedup token: identical retried blocks are deduped server-side
@@ -907,7 +917,10 @@ func main() {
 				Username: *flagCHUser,
 				Password: chPass,
 			},
-			DialTimeout: 10 * time.Second,
+			DialTimeout:     20 * time.Second,
+			MaxOpenConns:    64,
+			MaxIdleConns:    32,
+			ConnMaxLifetime: 10 * time.Minute,
 			Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
 		})
 		if err != nil {
