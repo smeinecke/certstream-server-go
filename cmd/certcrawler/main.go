@@ -11,10 +11,10 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +23,7 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/certificatetransparency"
+	"github.com/d-Rickyy-b/certstream-server-go/internal/tmpip"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/config"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/models"
 	"golang.org/x/net/publicsuffix"
@@ -404,6 +405,7 @@ var (
 	flagTmpIP        = flag.Bool("tmpip", false, "Rotate source IPv6 across all Devices in /etc/tmpiprest.conf")
 	flagTmpIPConf    = flag.String("tmpip-conf", "/etc/tmpiprest.conf", "tmpiprest config path (used with -tmpip)")
 	flagSrc6PerReq   = flag.Bool("src6-per-request", false, "New source IP per request instead of per connection (slower: TLS per request)")
+	flagProxy        = flag.String("proxy", "", "HTTP CONNECT proxy for CT fetches, e.g. http://127.0.0.1:1080 - run tmpipproxy on the tunnel host to rotate source IPv6 there")
 	flagVerify       = flag.Bool("verify", false, "Differential-test fastRow against the full parser per entry; log mismatches")
 	flagProgress     = flag.Duration("progress-every", 30*time.Second, "Progress log interval")
 	flagCHDSN        = flag.String("clickhouse-dsn", "", "ClickHouse host:port, e.g. '127.0.0.1:9000'")
@@ -769,76 +771,6 @@ func processGroup(ctx context.Context, g interval, jsonClient *client.LogClient,
 	return res
 }
 
-// randIPv6InPrefix returns a random IPv6 address within prefix, preserving the
-// network bits and randomizing the host bits (tmpiprest-style source rotation).
-func randIPv6InPrefix(prefix *net.IPNet) net.IP {
-	ones, _ := prefix.Mask.Size()
-	base := prefix.IP.To16()
-	ip := make(net.IP, 16)
-	for i := 0; i < 16; i++ {
-		pbits := ones - i*8
-		if pbits <= 0 {
-			ip[i] = byte(rand.Uint32())
-		} else if pbits >= 8 {
-			ip[i] = base[i]
-		} else {
-			mask := byte(0xFF << (8 - pbits))
-			ip[i] = (base[i] & mask) | (byte(rand.Uint32()) &^ mask)
-		}
-	}
-	return ip
-}
-
-// rotatingDialContext returns a DialContext that binds each connection to a
-// fresh random IPv6 source address, picked uniformly across pools. Forces
-// tcp6 - the target must have a AAAA record when rotation is used.
-func rotatingDialContext(pools []*net.IPNet) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		d := &net.Dialer{
-			LocalAddr: &net.TCPAddr{IP: randIPv6InPrefix(pools[rand.Intn(len(pools))])},
-			Timeout:   15 * time.Second,
-		}
-		return d.DialContext(ctx, "tcp6", addr)
-	}
-}
-
-// loadTmpIPPools parses a tmpiprest.conf file into rotation pools. Device
-// prefixes may carry a trailing ':' or '::' (as written for tmpip.py); mask
-// defaults to 48. Ignore lists are skipped - in a >= /56 the collision
-// probability with a configured address is negligible.
-func loadTmpIPPools(path string) ([]*net.IPNet, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var conf struct {
-		Devices []struct {
-			Prefix string `json:"prefix"`
-			If     string `json:"if"`
-			Mask   int    `json:"mask"`
-		} `json:"Devices"`
-	}
-	if err := json.Unmarshal(data, &conf); err != nil {
-		return nil, err
-	}
-	var pools []*net.IPNet
-	for _, d := range conf.Devices {
-		mask := d.Mask
-		if mask == 0 {
-			mask = 48
-		}
-		_, pfx, err := net.ParseCIDR(strings.TrimRight(d.Prefix, ":") + "::/" + strconv.Itoa(mask))
-		if err != nil {
-			return nil, fmt.Errorf("tmpip device %q: %w", d.If, err)
-		}
-		pools = append(pools, pfx)
-	}
-	if len(pools) == 0 {
-		return nil, fmt.Errorf("no Devices in %s", path)
-	}
-	return pools, nil
-}
-
 func main() {
 	flag.Parse()
 
@@ -869,7 +801,7 @@ func main() {
 	var pools []*net.IPNet
 	if *flagTmpIP {
 		var perr error
-		pools, perr = loadTmpIPPools(*flagTmpIPConf)
+		pools, perr = tmpip.LoadPools(*flagTmpIPConf)
 		if perr != nil {
 			log.Fatalf("tmpiprest config: %v", perr)
 		}
@@ -880,29 +812,41 @@ func main() {
 		}
 		pools = []*net.IPNet{pfx}
 	}
-	for _, pfx := range pools {
-		if ones, _ := pfx.Mask.Size(); ones > 64 {
-			log.Fatalf("rotation prefix %s is narrower than /64 - refusing (per-IP rate limits may aggregate)", pfx)
-		}
+	if err := tmpip.CheckPools(pools); err != nil {
+		log.Fatalln(err)
 	}
-	if len(pools) > 0 {
-		hc.Transport = &http.Transport{
-			DialContext:           rotatingDialContext(pools),
-			DisableKeepAlives:     *flagSrc6PerReq, // per-request rotation costs a TLS handshake each time
+	if len(pools) > 0 || *flagProxy != "" {
+		// Through a CONNECT proxy the upstream source IP is pinned per tunnel;
+		// reusing conns lets rate-limits stick - always dial fresh tunnels.
+		disableKeepAlive := *flagSrc6PerReq || *flagProxy != ""
+		tr := &http.Transport{
+			DisableKeepAlives:     disableKeepAlive,
 			IdleConnTimeout:       10 * time.Second,
 			TLSHandshakeTimeout:   20 * time.Second,
 			ResponseHeaderTimeout: 60 * time.Second,
 			MaxConnsPerHost:       concurrency * 2,
 		}
-		mode := "per-connection"
-		if *flagSrc6PerReq {
-			mode = "per-request"
+		if *flagProxy != "" {
+			purl, perr := url.Parse(*flagProxy)
+			if perr != nil {
+				log.Fatalf("invalid -proxy %q: %v", *flagProxy, perr)
+			}
+			tr.Proxy = http.ProxyURL(purl)
+			log.Printf("fetching via CONNECT proxy %s (fresh tunnel per request)", *flagProxy)
 		}
-		var names []string
-		for _, p := range pools {
-			names = append(names, p.String())
+		if len(pools) > 0 {
+			tr.DialContext = tmpip.RotatingDialContext(pools)
+			mode := "per-connection"
+			if *flagSrc6PerReq {
+				mode = "per-request"
+			}
+			var names []string
+			for _, p := range pools {
+				names = append(names, p.String())
+			}
+			log.Printf("rotating source IPv6 across %s (%s)", strings.Join(names, ", "), mode)
 		}
-		log.Printf("rotating source IPv6 across %s (%s)", strings.Join(names, ", "), mode)
+		hc.Transport = tr
 	}
 	jsonClient, err := client.New(ctLog, hc, jsonclient.Options{UserAgent: userAgent})
 	if err != nil {
