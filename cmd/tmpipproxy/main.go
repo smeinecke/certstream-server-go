@@ -13,6 +13,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
@@ -33,11 +35,32 @@ var (
 	flagConns     = flag.Int("max-conns", 2048, "max concurrent tunnels")
 	flagAllowHTTP = flag.Bool("allow-plain", false, "also accept plain GET/POST requests (forwarded verbatim)")
 	flagVerbose   = flag.Bool("v", false, "log every CONNECT with its chosen source address")
+	flagToken     = flag.String("token", "", "require Proxy-Authorization with this password (Basic user:token) - use when listening on a public address")
 )
 
 var pools []*net.IPNet
 var sem chan struct{}
 var dialLog atomic.Int64
+
+// checkAuth verifies the Basic proxy password against -token; the user part
+// is ignored so any userinfo works (http://x:token@host).
+func checkAuth(req *http.Request) bool {
+	h := req.Header.Get("Proxy-Authorization")
+	const p = "Basic "
+	if !strings.HasPrefix(h, p) {
+		return false
+	}
+	dec, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(h, p))
+	if err != nil {
+		return false
+	}
+	user, pass, ok := strings.Cut(string(dec), ":")
+	_ = user
+	if !ok {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(pass), []byte(*flagToken)) == 1
+}
 
 func main() {
 	flag.Parse()
@@ -83,6 +106,10 @@ func handle(client net.Conn) {
 	br := bufio.NewReader(client)
 	req, err := http.ReadRequest(br)
 	if err != nil {
+		return
+	}
+	if *flagToken != "" && !checkAuth(req) {
+		fmt.Fprintf(client, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"tmpipproxy\"\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
 	if req.Method != http.MethodConnect {

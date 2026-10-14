@@ -33,3 +33,6 @@ dist/
 config.yaml
 config.yml
 ct_index.json
+certcrawler
+certcrawler-static
+tmpipproxy

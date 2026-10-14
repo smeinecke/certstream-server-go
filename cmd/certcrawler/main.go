@@ -413,6 +413,7 @@ var (
 	flagCHTable      = flag.String("clickhouse-table", "certs", "ClickHouse table name")
 	flagCHUser       = flag.String("clickhouse-user", "default", "ClickHouse user")
 	flagCHPass       = flag.String("clickhouse-password", "", "ClickHouse password")
+	flagCHPassFile   = flag.String("clickhouse-password-file", "", "File containing the ClickHouse password (overrides -clickhouse-password)")
 	flagQuiet        = flag.Bool("quiet", false, "Do not write JSON entries to stdout")
 )
 
@@ -827,11 +828,22 @@ func main() {
 			MaxConnsPerHost:       concurrency * 2,
 		}
 		if *flagProxy != "" {
-			purl, perr := url.Parse(*flagProxy)
-			if perr != nil {
-				log.Fatalf("invalid -proxy %q: %v", *flagProxy, perr)
+			var proxyURLs []*url.URL
+			for _, p := range strings.Split(*flagProxy, ",") {
+				purl, perr := url.Parse(strings.TrimSpace(p))
+				if perr != nil {
+					log.Fatalf("invalid -proxy %q: %v", p, perr)
+				}
+				proxyURLs = append(proxyURLs, purl)
 			}
-			tr.Proxy = http.ProxyURL(purl)
+			if len(proxyURLs) == 1 {
+				tr.Proxy = http.ProxyURL(proxyURLs[0])
+			} else {
+				// multiple endpoints - spread requests across them
+				tr.Proxy = func(*http.Request) (*url.URL, error) {
+					return proxyURLs[rand.Intn(len(proxyURLs))], nil
+				}
+			}
 			log.Printf("fetching via CONNECT proxy %s (fresh tunnel per request)", *flagProxy)
 		}
 		if len(pools) > 0 {
@@ -879,13 +891,21 @@ func main() {
 
 	// ClickHouse setup
 	var chConn clickhouse.Conn
+	chPass := *flagCHPass
+	if *flagCHPassFile != "" {
+		b, rerr := os.ReadFile(*flagCHPassFile)
+		if rerr != nil {
+			log.Fatalf("clickhouse-password-file: %v", rerr)
+		}
+		chPass = strings.TrimSpace(string(b))
+	}
 	if *flagCHDSN != "" {
 		chConn, err = clickhouse.Open(&clickhouse.Options{
 			Addr: []string{strings.TrimPrefix(strings.TrimPrefix(*flagCHDSN, "tcp://"), "clickhouse://")},
 			Auth: clickhouse.Auth{
 				Database: *flagCHDB,
 				Username: *flagCHUser,
-				Password: *flagCHPass,
+				Password: chPass,
 			},
 			DialTimeout: 10 * time.Second,
 			Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
