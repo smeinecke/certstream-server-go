@@ -3,116 +3,150 @@ package metrics
 import (
 	"fmt"
 	"io"
+	"log"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/d-Rickyy-b/certstream-server-go/internal/certificatetransparency"
-	"github.com/d-Rickyy-b/certstream-server-go/internal/web"
-
 	"github.com/VictoriaMetrics/metrics"
 )
 
-var (
-	ctLogMetricsInitialized = false
-	ctLogMetricsInitMutex   = &sync.Mutex{}
+var illegalCharacters = []string{"{", "}", "\n", `"`}
 
-	tempCertMetricsLastRefreshed = time.Time{}
-	tempCertMetrics              = certificatetransparency.CTMetrics{}
+var Prometheus = NewPrometheusExporter()
 
+// PrometheusExporter is holds the metrics for the Prometheus exporter. It also provides helper functions
+// to register new metrics and write the metrics data to an http response.
+//
+//nolint:unused
+type PrometheusExporter struct {
 	// Number of currently connected clients.
-	fullClientCount = metrics.NewGauge("certstreamservergo_clients_total{type=\"full\"}", func() float64 {
-		return float64(web.ClientHandler.ClientFullCount())
+	fullClientCount   metrics.Gauge
+	liteClientCount   metrics.Gauge
+	domainClientCount metrics.Gauge
+
+	tempCertMetricsLastRefreshed time.Time
+	tempCertMetrics              CTMetrics
+	tempCertMetricsMutex         sync.RWMutex
+
+	skippedCertsCallback func() map[string]int64
+}
+
+// NewPrometheusExporter creates a new PrometheusExporter and registers the default metrics for the number of processed certificates.
+func NewPrometheusExporter() *PrometheusExporter {
+	exporter := &PrometheusExporter{}
+	// Register metrics for the total number of certificates processed by the CT watcher.
+	metrics.GetOrCreateGauge("certstreamservergo_certificates_total{type=\"regular\"}", func() float64 {
+		return float64(GetProcessedCerts())
 	})
-	liteClientCount = metrics.NewGauge("certstreamservergo_clients_total{type=\"lite\"}", func() float64 {
-		return float64(web.ClientHandler.ClientLiteCount())
-	})
-	domainClientCount = metrics.NewGauge("certstreamservergo_clients_total{type=\"domain\"}", func() float64 {
-		return float64(web.ClientHandler.ClientDomainsCount())
+	metrics.GetOrCreateGauge("certstreamservergo_certificates_total{type=\"precert\"}", func() float64 {
+		return float64(GetProcessedPrecerts())
 	})
 
-	// Number of certificates processed by the CT watcher.
-	processedCertificates = metrics.NewGauge("certstreamservergo_certificates_total{type=\"regular\"}", func() float64 {
-		return float64(certificatetransparency.GetProcessedCerts())
-	})
-	processedPreCertificates = metrics.NewGauge("certstreamservergo_certificates_total{type=\"precert\"}", func() float64 {
-		return float64(certificatetransparency.GetProcessedPrecerts())
-	})
-)
+	return exporter
+}
 
-// WritePrometheus provides an easy way to write metrics to a writer.
-func WritePrometheus(w io.Writer, exposeProcessMetrics bool) {
-	ctLogMetricsInitMutex.Lock()
-	if !ctLogMetricsInitialized {
-		initCtLogMetrics()
-	}
-	ctLogMetricsInitMutex.Unlock()
-
-	getSkippedCertMetrics()
-
+// Write is a callback function that is called by a webserver in order to write metrics data to the http response.
+func (pm *PrometheusExporter) Write(w io.Writer, exposeProcessMetrics bool) {
 	metrics.WritePrometheus(w, exposeProcessMetrics)
 }
 
-// For having metrics regarding each individual CT log, we need to register them manually.
-// initCtLogMetrics fetches all the CT Logs and registers one metric per log.
-func initCtLogMetrics() {
-	logs := certificatetransparency.GetLogOperators()
+// RegisterGaugeMetric is a helper function that registers a new gauge metric with a float64 callback function.
+func (pm *PrometheusExporter) RegisterGaugeMetric(label string, callback func() float64) {
+	metrics.GetOrCreateGauge(label, callback)
+}
 
-	for operator, urls := range logs {
-		operator := operator // Copy variable to new scope
+// RegisterGaugeMetricInt is a helper function that registers a new gauge metric with an int64 callback function.
+func (pm *PrometheusExporter) RegisterGaugeMetricInt(label string, callback func() int64) {
+	metrics.GetOrCreateGauge(label, func() float64 { return float64(callback()) })
+}
 
-		for i := 0; i < len(urls); i++ {
-			url := urls[i]
-			name := fmt.Sprintf("certstreamservergo_certs_by_log_total{url=\"%s\",operator=\"%s\"}", url, operator)
-			metrics.NewGauge(name, func() float64 {
-				return float64(getCertCountForLog(operator, url))
-			})
-		}
+// RegisterClient registers a new gauge metric for the client with the given name.
+func (pm *PrometheusExporter) RegisterClient(id string, skippedCertsCallback func() float64) {
+	argMap := make(map[string]string)
+	argMap["id"] = id
+
+	label := createMetric("certstreamservergo_skipped_certs", argMap)
+
+	metrics.GetOrCreateGauge(label, skippedCertsCallback)
+}
+
+// UnregisterClient unregisters the metric for the client with the given name.
+func (pm *PrometheusExporter) UnregisterClient(id string) {
+	argMap := make(map[string]string)
+	argMap["id"] = id
+
+	label := createMetric("certstreamservergo_skipped_certs", argMap)
+
+	ok := metrics.UnregisterMetric(label)
+	if !ok {
+		log.Printf("failed to unregister metric '%s'", label)
 	}
+}
 
-	if len(logs) > 0 {
-		ctLogMetricsInitialized = true
-	}
+// RegisterLog registers a new gauge metric for the given CT log.
+// The metric will be named "certstreamservergo_certs_by_log_total{url=\"<url>\",operator=\"<operatorName>\"}" and
+// will call the given callback function to get the current value of the metric.
+func (pm *PrometheusExporter) RegisterLog(operatorName, url string) {
+	label := fmt.Sprintf("certstreamservergo_certs_by_log_total{url=\"%s\",operator=\"%s\"}", url, operatorName)
+	metrics.GetOrCreateGauge(label, func() float64 {
+		return float64(pm.getCertCountForLog(operatorName, url))
+	})
+}
+
+// UnregisterMetric unregisters a metric with a given label.
+func (pm *PrometheusExporter) UnregisterMetric(label string) {
+	metrics.UnregisterMetric(label)
 }
 
 // getCertCountForLog returns the number of certificates processed from a specific CT log.
 // It caches the result for 5 seconds. Subsequent calls to this method will return the cached result.
-func getCertCountForLog(operatorName, logname string) int64 {
+func (pm *PrometheusExporter) getCertCountForLog(operatorName, logname string) int64 {
+	pm.tempCertMetricsMutex.Lock()
+	defer pm.tempCertMetricsMutex.Unlock()
+
 	// Add some caching to avoid having to lock the mutex every time
-	if time.Since(tempCertMetricsLastRefreshed) > time.Second*5 {
-		tempCertMetricsLastRefreshed = time.Now()
-		tempCertMetrics = certificatetransparency.GetCertMetrics()
+	if time.Since(pm.tempCertMetricsLastRefreshed) > time.Second*5 {
+		pm.tempCertMetricsLastRefreshed = time.Now()
+		pm.tempCertMetrics = GetCertMetrics()
 	}
 
-	return tempCertMetrics[operatorName][logname]
+	operatorMetrics, ok := pm.tempCertMetrics[operatorName]
+	if !ok {
+		log.Printf("No metrics for operator \"%s\"", operatorName)
+		return 0
+	}
+
+	count, ok := operatorMetrics[logname]
+	if !ok {
+		log.Printf("No metrics for log \"%s\" of operator \"%s\"", logname, operatorName)
+		return 0
+	}
+
+	return count
 }
 
-// getSkippedCertMetrics gets the number of skipped certificates for each client and creates metrics for it.
-// It also removes metrics for clients that are not connected anymore.
-func getSkippedCertMetrics() {
-	skippedCerts := web.ClientHandler.GetSkippedCerts()
-	for clientName := range skippedCerts {
-		// Get or register a new counter for each client
-		metricName := fmt.Sprintf("certstreamservergo_skipped_certs{client=\"%s\"}", clientName)
-		c := metrics.GetOrCreateCounter(metricName)
-		c.Set(skippedCerts[clientName])
+func createMetric(metricName string, argMap map[string]string) string {
+	argString := ""
+
+	for _, key := range slices.Sorted(maps.Keys(argMap)) {
+		key = sanitizeMetricValue(key)
+		key = strings.ReplaceAll(key, " ", "_")
+		value := sanitizeMetricValue(argMap[key])
+		argString += fmt.Sprintf(`%s="%s",`, key, value) //nolint:perfsprint
 	}
 
-	// Remove all metrics that are not in the list of current client skipped cert metrics
-	// Get a list of current client skipped cert metrics
-	for _, metricName := range metrics.ListMetricNames() {
-		if !strings.HasPrefix(metricName, "certstreamservergo_skipped_certs") {
-			continue
-		}
+	argString = strings.TrimRight(argString, ",")
 
-		clientName := strings.TrimPrefix(metricName, "certstreamservergo_skipped_certs{client=\"")
-		clientName = strings.TrimSuffix(clientName, "\"}")
+	return fmt.Sprintf("%s{%s}", metricName, argString)
+}
 
-		// Check if the registered metric is in the list of current client skipped cert metrics
-		// If not, unregister the metric
-		_, exists := skippedCerts[clientName]
-		if !exists {
-			metrics.UnregisterMetric(metricName)
-		}
+func sanitizeMetricValue(value string) string {
+	for _, char := range illegalCharacters {
+		value = strings.ReplaceAll(value, char, "_")
 	}
+
+	return value
 }

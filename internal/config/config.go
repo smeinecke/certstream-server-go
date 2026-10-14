@@ -1,215 +1,152 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"log"
-	"net"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"github.com/spf13/viper"
 )
 
 var (
+	// AppConfig holds the parsed configuration.
 	AppConfig Config
-	Version   = "1.7.0"
+	Version   = "1.10.1"
+
+	ErrInvalidConfig = errors.New("invalid configuration")
+	URLPathRegex     = regexp.MustCompile(`^(/[a-zA-Z0-9\-._]+)+$`)
+	URLRegex         = regexp.MustCompile(`^https?://[a-zA-Z0-9\-._]+(:[0-9]+)?(/[a-zA-Z0-9\-._]+)*/?$`)
 )
 
-type ServerConfig struct {
-	ListenAddr  string   `yaml:"listen_addr"`
-	ListenPort  int      `yaml:"listen_port"`
-	CertPath    string   `yaml:"cert_path"`
-	CertKeyPath string   `yaml:"cert_key_path"`
-	RealIP      bool     `yaml:"real_ip"`
-	Whitelist   []string `yaml:"whitelist"`
-}
-
-type LogConfig struct {
-	Operator    string `yaml:"operator"`
-	URL         string `yaml:"url"`
-	Description string `yaml:"description"`
-}
-
 type Config struct {
-	Webserver struct {
-		ServerConfig       `yaml:",inline"`
-		FullURL            string `yaml:"full_url"`
-		LiteURL            string `yaml:"lite_url"`
-		DomainsOnlyURL     string `yaml:"domains_only_url"`
-		CompressionEnabled bool   `yaml:"compression_enabled"`
-	}
-	Prometheus struct {
-		ServerConfig        `yaml:",inline"`
-		Enabled             bool   `yaml:"enabled"`
-		MetricsURL          string `yaml:"metrics_url"`
-		ExposeSystemMetrics bool   `yaml:"expose_system_metrics"`
-	}
-	General struct {
-		AdditionalLogs []LogConfig `yaml:"additional_logs"`
-	}
+	Webserver        Webserver
+	Prometheus       Prometheus
+	StreamProcessing []StreamProcessor `mapstructure:"stream_processing"`
+	General          General
 }
 
-// ReadConfig reads the config file and returns a filled Config struct.
+// ReadConfig reads the configuration using Viper and returns a filled Config struct.
+// It also validates and stores the result in AppConfig.
 func ReadConfig(configPath string) (Config, error) {
-	log.Printf("Reading config file '%s'...\n", configPath)
-
-	conf, parseErr := parseConfigFromFile(configPath)
-	if parseErr != nil {
-		log.Fatalln("Error while parsing yaml file:", parseErr)
-	}
-
-	if !validateConfig(conf) {
-		log.Fatalln("Invalid config")
-	}
-	AppConfig = *conf
-
-	return *conf, nil
+	v := initViper(configPath)
+	return loadConfigFromViper(v)
 }
 
-// parseConfigFromFile reads the config file as bytes and passes it to parseConfigFromBytes.
-// It returns a filled Config struct.
-func parseConfigFromFile(configFile string) (*Config, error) {
-	if configFile == "" {
-		configFile = "config.yml"
-	}
-
-	// Check if the file exists
-	absPath, err := filepath.Abs(configFile)
-	if err != nil {
-		log.Printf("Couldn't convert to absolute path: '%s'\n", configFile)
-		return &Config{}, err
-	}
-
-	if _, statErr := os.Stat(absPath); os.IsNotExist(statErr) {
-		log.Printf("Config file '%s' does not exist\n", absPath)
-		ext := filepath.Ext(absPath)
-		absPath = strings.TrimSuffix(absPath, ext)
-
-		switch ext {
-		case ".yaml":
-			absPath += ".yml"
-		case ".yml":
-			absPath += ".yaml"
-		default:
-			log.Printf("Config file '%s' does not have a valid extension\n", configFile)
-			return &Config{}, statErr
-		}
-
-		if _, secondStatErr := os.Stat(absPath); os.IsNotExist(secondStatErr) {
-			log.Printf("Config file '%s' does not exist\n", absPath)
-			return &Config{}, secondStatErr
-		}
-	}
-	log.Printf("File '%s' exists\n", absPath)
-
-	yamlFileContent, readErr := os.ReadFile(absPath)
-	if readErr != nil {
-		return &Config{}, readErr
-	}
-
-	conf, parseErr := parseConfigFromBytes(yamlFileContent)
-	if parseErr != nil {
-		return &Config{}, parseErr
-	}
-
-	return conf, nil
+// ValidateConfig validates the config file and returns an error if the config is invalid.
+func ValidateConfig(configPath string) error {
+	_, parseErr := ReadConfig(configPath)
+	return parseErr
 }
 
-// parseConfigFromBytes parses the config bytes and returns a filled Config struct.
-func parseConfigFromBytes(data []byte) (*Config, error) {
-	var config Config
+// initViper sets up the viper instance with defaults, config file and environment variable support.
+// configPath is the path to the YAML config file (e.g. "config.yaml").
+// Environment variables are mapped with the prefix "CERTSTREAM" and "_" as key delimiter.
+// Example: CERTSTREAM_WEBSERVER_LISTEN_PORT overrides webserver.listen_port.
+func initViper(configPath string) *viper.Viper {
+	v := viper.NewWithOptions(viper.KeyDelimiter("."))
 
-	err := yaml.Unmarshal(data, &config)
-	if err != nil {
-		return &config, err
+	// Defaults
+	v.SetDefault("webserver.listen_addr", "0.0.0.0")
+	v.SetDefault("webserver.listen_port", 8080)
+	v.SetDefault("webserver.full_url", "/full-stream")
+	v.SetDefault("webserver.lite_url", "/")
+	v.SetDefault("webserver.domains_only_url", "/domains-only")
+	v.SetDefault("webserver.real_ip", false)
+	v.SetDefault("webserver.trusted_proxies", []string{})
+	v.SetDefault("webserver.whitelist", []string{})
+	v.SetDefault("webserver.compression_enabled", false)
+
+	v.SetDefault("prometheus.enabled", false)
+	v.SetDefault("prometheus.listen_addr", "0.0.0.0")
+	v.SetDefault("prometheus.listen_port", 9090)
+	v.SetDefault("prometheus.metrics_url", "/metrics")
+	v.SetDefault("prometheus.expose_system_metrics", false)
+	v.SetDefault("prometheus.real_ip", false)
+	v.SetDefault("prometheus.trusted_proxies", []string{})
+	v.SetDefault("prometheus.whitelist", []string{})
+
+	v.SetDefault("general.disable_default_logs", false)
+	v.SetDefault("general.buffer_sizes.websocket", 300)
+	v.SetDefault("general.buffer_sizes.ctlog", 1000)
+	v.SetDefault("general.buffer_sizes.broadcastmanager", 10000)
+	v.SetDefault("general.drop_old_logs", true)
+	v.SetDefault("general.recovery.enabled", false)
+	v.SetDefault("general.recovery.ct_index_file", "./ct_index.json")
+
+	if configPath != "" {
+		v.SetConfigFile(configPath)
+	} else {
+		v.SetConfigName("config")
+		v.AddConfigPath(".")
+		v.AddConfigPath("/app/config")
 	}
 
-	return &config, nil
+	v.SetConfigType("yaml")
+
+	if err := v.ReadInConfig(); err != nil {
+		var notFound viper.ConfigFileNotFoundError
+		if errors.As(err, &notFound) {
+			log.Println("No config file found, using defaults and environment variables only")
+		} else {
+			log.Fatalf("Error reading config file: %v", err)
+		}
+	} else {
+		log.Printf("Using config file: %s\n", v.ConfigFileUsed())
+	}
+
+	// Environment variables
+	// Prefix: CERTSTREAM  (e.g. CERTSTREAM_WEBSERVER_LISTEN_PORT)
+	// Viper uses "." as key delimiter internally; environment variables use "_".
+	// We replace "." with "_" when looking up env vars automatically.
+	v.SetEnvPrefix("CERTSTREAM")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+
+	return v
+}
+
+// loadConfigFromViper unmarshals a viper instance into a Config struct, validates it
+// and stores the result in AppConfig.
+func loadConfigFromViper(v *viper.Viper) (Config, error) {
+	var cfg Config
+
+	if err := v.Unmarshal(&cfg); err != nil {
+		return cfg, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	if !validateConfig(&cfg) {
+		return cfg, ErrInvalidConfig
+	}
+
+	AppConfig = cfg
+
+	return cfg, nil
 }
 
 // validateConfig validates the config values and sets defaults for missing values.
 func validateConfig(config *Config) bool {
 	// Still matches invalid IP addresses but good enough for detecting completely wrong formats
-	URLPathRegex := regexp.MustCompile(`^(/[a-zA-Z0-9\-._]+)+$`)
-	URLRegex := regexp.MustCompile(`^https?://[a-zA-Z0-9\-._]+(:[0-9]+)?(/[a-zA-Z0-9\-._]+)*$`)
 
 	// Check webserver config
-	if config.Webserver.ListenAddr == "" || net.ParseIP(config.Webserver.ListenAddr) == nil {
-		log.Fatalln("Webhook listen IP is not a valid IP: ", config.Webserver.ListenAddr)
+	if !config.Webserver.Valid() {
 		return false
 	}
 
-	if config.Webserver.ListenPort == 0 {
-		log.Fatalln("Webhook listen port is not set")
+	if !config.Prometheus.Valid() {
 		return false
 	}
 
-	if config.Webserver.FullURL == "" || !URLPathRegex.MatchString(config.Webserver.FullURL) {
-		log.Println("Webhook full URL is not set or does not match pattern '/...'")
-		config.Webserver.FullURL = "/full-stream"
-	}
-
-	if config.Webserver.LiteURL == "" || !URLPathRegex.MatchString(config.Webserver.FullURL) {
-		log.Println("Webhook lite URL is not set or does not match pattern '/...'")
-		config.Webserver.LiteURL = "/"
-	}
-
-	if config.Webserver.DomainsOnlyURL == "" || !URLPathRegex.MatchString(config.Webserver.DomainsOnlyURL) {
-		log.Println("Webhook domains only URL is not set or does not match pattern '/...'")
-		config.Webserver.FullURL = "/domains-only"
-	}
-
-	if config.Webserver.FullURL == config.Webserver.LiteURL {
-		log.Fatalln("Webhook full URL is the same as lite URL - please fix the config!")
-	}
-
-	if config.Webserver.DomainsOnlyURL == "" {
-		config.Webserver.FullURL = "/domains-only"
-	}
-
-	if config.Prometheus.Enabled {
-
-		if config.Prometheus.ListenAddr == "" || net.ParseIP(config.Prometheus.ListenAddr) == nil {
-			log.Fatalln("Metrics export IP is not a valid IP")
+	for _, processor := range config.StreamProcessing {
+		if !processor.Valid() {
 			return false
 		}
-
-		if config.Prometheus.ListenPort == 0 {
-			log.Fatalln("Metrics export port is not set")
-			return false
-		}
-
-		if config.Prometheus.Whitelist == nil {
-			config.Prometheus.Whitelist = []string{}
-		}
-
-		// Check if IPs in whitelist match pattern
-		for _, ip := range config.Prometheus.Whitelist {
-			if net.ParseIP(ip) == nil {
-				// Provided entry is not an IP, check if it's a CIDR range
-				_, _, err := net.ParseCIDR(ip)
-				if err != nil {
-					log.Fatalln("Invalid IP in metrics whitelist: ", ip)
-					return false
-				}
-			}
-		}
 	}
 
-	var validLogs []LogConfig
-	if len(config.General.AdditionalLogs) > 0 {
-		for _, ctLog := range config.General.AdditionalLogs {
-			if !URLRegex.MatchString(ctLog.URL) {
-				log.Println("Ignoring invalid additional log URL: ", ctLog.URL)
-				continue
-			}
-
-			validLogs = append(validLogs, ctLog)
-		}
+	if !config.General.Valid() {
+		return false
 	}
-
-	config.General.AdditionalLogs = validLogs
 
 	return true
 }

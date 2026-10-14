@@ -12,6 +12,7 @@ import (
 
 	"github.com/d-Rickyy-b/certstream-server-go/internal/certificatetransparency"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/config"
+	"github.com/d-Rickyy-b/certstream-server-go/internal/models"
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/client"
@@ -26,6 +27,7 @@ func main() {
 	certIDFlag := flag.Int64("cert", 0, "ID of the certificate to fetch from the CT log")
 	chainFlag := flag.Bool("chain", false, "Include full chain for the certificate")
 	asDERFlag := flag.Bool("asder", false, "Include DER encoding of the certificate")
+
 	flag.Parse()
 
 	ctLog := *ctLogFlag
@@ -34,32 +36,43 @@ func main() {
 	if ctLog == "" {
 		log.Fatalln("CT log URL is required")
 	}
+
 	if !strings.HasPrefix(ctLog, "https://") {
 		ctLog = "https://" + ctLog
 	}
 
-	// Initialize the http client and json client provided by the ct library
-	hc := http.Client{Timeout: 30 * time.Second}
-	jsonClient, e := client.New(ctLog, &hc, jsonclient.Options{UserAgent: userAgent})
+	// Initialize the httpClient and jsonClient provided by the ct library
+	httpClient := http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSHandshakeTimeout:   30 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			MaxIdleConnsPerHost:   10,
+			DisableKeepAlives:     false,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+
+	jsonClient, e := client.New(ctLog, &httpClient, jsonclient.Options{UserAgent: userAgent})
 	if e != nil {
 		log.Fatalln("Error creating JSON client:", e)
 	}
 
-	// Get entries from CT log
-	c, _ := context.WithTimeout(context.Background(), 10*time.Second)
-	entries, getEntriesErr := jsonClient.GetRawEntries(c, certID, certID)
-	if getEntriesErr != nil {
-		log.Fatalln("Error getting entries from CT log: ", getEntriesErr)
+	entries, getEntryErr := getEntry(jsonClient, certID)
+	if getEntryErr != nil {
+		log.Fatalln("Error getting entry from CT log: ", getEntryErr)
 	}
 
-	// Loop over entries and pars each one.
+	// Loop over entries and parse each one.
 	for _, leafEntry := range entries.Entries {
 		rawLogEntry, err := ct.RawLogEntryFromLeaf(certID, &leafEntry)
 		if err != nil {
 			log.Fatalln("Error creating raw log entry: ", err)
 		}
 
-		entry, parseErr := certificatetransparency.ParseCertstreamEntry(rawLogEntry, "N/A", "N/A", ctLog)
+		entry, parseErr := certificatetransparency.ParseCertstreamEntry(rawLogEntry, "N/A", "N/A", ctLog, models.SourceIsRFC6962)
 		if parseErr != nil {
 			log.Fatalln("Error parsing certstream entry: ", parseErr)
 		}
@@ -72,6 +85,7 @@ func main() {
 			if logEntry.X509Cert != nil && matcher.CertificateMatches(logEntry.X509Cert) {
 				entry.Data.UpdateType = "X509LogEntry"
 			}
+
 			if logEntry.Precert != nil && matcher.PrecertificateMatches(logEntry.Precert) {
 				entry.Data.UpdateType = "PrecertLogEntry"
 			}
@@ -98,4 +112,18 @@ func main() {
 
 		fmt.Println(string(result))
 	}
+}
+
+// getEntry fetches a single cert from an RFC6962 CT log by its ID.
+func getEntry(jsonClient *client.LogClient, certID int64) (*ct.GetEntriesResponse, error) {
+	// Get entries from CT log
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	entries, err := jsonClient.GetRawEntries(ctx, certID, certID)
+	if err != nil {
+		return nil, fmt.Errorf("error getting raw entries: %w", err)
+	}
+
+	return entries, nil
 }

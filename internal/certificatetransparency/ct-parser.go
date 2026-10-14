@@ -6,11 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"hash"
 	"log"
 	"math/big"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,19 +22,30 @@ import (
 )
 
 // parseData converts a *ct.RawLogEntry struct into a certstream.Data struct by copying some values and calculating others.
-func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL string) (models.Data, error) {
-	certLink := fmt.Sprintf("%s/ct/v1/get-entries?start=%d&end=%d", ctURL, entry.Index, entry.Index)
+func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL, logType string) (models.Data, error) {
+	var certLink string
+	// There is no direct link for tiled ct logs
+	if logType == models.SourceIsRFC6962 {
+		certLink = fmt.Sprintf("%s/ct/v1/get-entries?start=%d&end=%d", ctURL, entry.Index, entry.Index)
+	}
+
+	// Handle gosec G115 warning
+	if entry.Index < 0 {
+		return models.Data{}, fmt.Errorf("invalid cert index: %d", entry.Index)
+	}
 
 	// Create main data structure
 	data := models.Data{
-		CertIndex: entry.Index,
+		CertIndex: uint64(entry.Index),
 		CertLink:  certLink,
 		Seen:      float64(time.Now().UnixMilli()) / 1_000,
 		Source: models.Source{
 			Name:          logName,
 			URL:           ctURL,
+			Timestamp:     float64(entry.Leaf.TimestampedEntry.Timestamp) / 1_000,
 			Operator:      operatorName,
 			NormalizedURL: normalizeCtlogURL(ctURL),
+			Type:          logType,
 		},
 		UpdateType: "X509LogEntry",
 	}
@@ -43,7 +54,7 @@ func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL string) (mode
 	logEntry, conversionErr := entry.ToLogEntry()
 	if conversionErr != nil {
 		log.Println("Could not convert entry to LogEntry: ", conversionErr)
-		return models.Data{}, conversionErr
+		return models.Data{}, fmt.Errorf("could not convert entry to logentry: %w", conversionErr)
 	}
 
 	var cert *x509.Certificate
@@ -60,7 +71,7 @@ func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL string) (mode
 		rawData = logEntry.Precert.Submitted.Data
 		isPrecert = true
 	default:
-		return models.Data{}, errors.New("could not parse entry: no certificate found")
+		return models.Data{}, ErrNoCertFound
 	}
 
 	// Calculate certificate hash from the raw DER bytes of the certificate
@@ -72,17 +83,25 @@ func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL string) (mode
 		data.LeafCert.Fingerprint = calculatedHash
 		data.LeafCert.SHA1 = calculatedHash
 		data.LeafCert.SHA256 = calculateSHA256(rawData)
+
+		// Since we use the TBSCertificate to parse the LeafCert, the PoisonByte indicator cannot be set by our parser.
+		// According to RFC 6962 Section 3.2 the `"tbs_certificate" is the DER-encoded TBSCertificate (see [RFC5280])
+		// component of the Precertificate -- that is, without the signature and the poison extension.`
+		// Since the PoisonByte Extension `is to ensure that the Precertificate cannot be validated by a standard
+		// X.509v3 client`, we can safely set it for each precertificate.
+		data.LeafCert.Extensions.CTLPoisonByte = true
 	}
 
 	certAsDER := base64.StdEncoding.EncodeToString(entry.Cert.Data)
 	data.LeafCert.AsDER = certAsDER
 
-	var parseErr error
-	data.Chain, parseErr = parseCertificateChain(logEntry)
+	chain, parseErr := parseCertificateChain(logEntry)
 	if parseErr != nil {
 		log.Println("Could not parse certificate chain: ", parseErr)
 		return models.Data{}, parseErr
 	}
+
+	data.Chain = chain
 
 	return data, nil
 }
@@ -93,9 +112,8 @@ func parseCertificateChain(logEntry *ct.LogEntry) ([]models.LeafCert, error) {
 
 	for i, chainEntry := range logEntry.Chain {
 		myCert, parseErr := x509.ParseCertificate(chainEntry.Data)
-		if parseErr != nil {
-			log.Println("Error parsing certificate: ", parseErr)
-			return nil, parseErr
+		if parseErr != nil || myCert == nil {
+			return nil, fmt.Errorf("could not parse certificate: %w", parseErr)
 		}
 
 		leafCert := leafCertFromX509cert(*myCert)
@@ -117,21 +135,14 @@ func leafCertFromX509cert(cert x509.Certificate) models.LeafCert {
 		IsCA:               cert.IsCA,
 	}
 
-	// The zero value of DomainsEntry.Data is nil, but we want an empty array - especially for json marshalling later.
+	// The zero value of DomainsEntry.Data is nil, but we want an empty array - especially for JSON marshaling later.
 	if leafCert.AllDomains == nil {
 		leafCert.AllDomains = []string{}
 	}
 
 	leafCert.Subject = buildSubject(cert.Subject)
 	if *leafCert.Subject.CN != "" && !leafCert.IsCA {
-		domainAlreadyAdded := false
-		// TODO check if CN matches domain regex
-		for _, domain := range leafCert.AllDomains {
-			if domain == *leafCert.Subject.CN {
-				domainAlreadyAdded = true
-				break
-			}
-		}
+		domainAlreadyAdded := slices.Contains(leafCert.AllDomains, *leafCert.Subject.CN)
 
 		if !domainAlreadyAdded {
 			leafCert.AllDomains = append(leafCert.AllDomains, *leafCert.Subject.CN)
@@ -188,6 +199,18 @@ func leafCertFromX509cert(cert x509.Certificate) models.LeafCert {
 			leafCert.Extensions.AuthorityInfoAccess = &result
 		case extension.Id.Equal(x509.OIDExtensionCTPoison):
 			leafCert.Extensions.CTLPoisonByte = true
+		case extension.Id.Equal(x509.OIDExtensionCertificatePolicies):
+			var builder strings.Builder
+			for _, policy := range cert.PolicyIdentifiers {
+				// The current way of joining the string leaves us with a trailing newline,
+				// but that's how the original certstream server does it too.
+				builder.WriteString("Policy: ")
+				builder.WriteString(policy.String())
+				builder.WriteString("\n")
+			}
+
+			policyString := builder.String()
+			leafCert.Extensions.CertificatePolicies = &policyString
 		}
 	}
 
@@ -208,27 +231,27 @@ func buildSubject(certSubject pkix.Name) models.Subject {
 	var aggregated string
 
 	if subject.C != nil {
-		aggregated += fmt.Sprintf("/C=%s", *subject.C)
+		aggregated += "/C=" + *subject.C
 	}
 
 	if subject.CN != nil {
-		aggregated += fmt.Sprintf("/CN=%s", *subject.CN)
+		aggregated += "/CN=" + *subject.CN
 	}
 
 	if subject.L != nil {
-		aggregated += fmt.Sprintf("/L=%s", *subject.L)
+		aggregated += "/L=" + *subject.L
 	}
 
 	if subject.O != nil {
-		aggregated += fmt.Sprintf("/O=%s", *subject.O)
+		aggregated += "/O=" + *subject.O
 	}
 
 	if subject.OU != nil {
-		aggregated += fmt.Sprintf("/OU=%s", *subject.OU)
+		aggregated += "/OU=" + *subject.OU
 	}
 
 	if subject.ST != nil {
-		aggregated += fmt.Sprintf("/ST=%s", *subject.ST)
+		aggregated += "/ST=" + *subject.ST
 	}
 
 	subject.Aggregated = &aggregated
@@ -246,7 +269,7 @@ func formatKeyID(keyID []byte) *string {
 	}
 
 	digest = strings.TrimLeft(digest, ":")
-	digest = fmt.Sprintf("keyid:%s", digest)
+	digest = "keyid:" + digest
 
 	return &digest
 }
@@ -277,7 +300,8 @@ func parseName(input []string) *string {
 	return &result
 }
 
-// calculateHash takes a hash.Hash struct and calculates the fingerprint of the given data.
+// calculateHash takes a hash.Hash implementation and calculates the hash of the given data.
+// It returns the hash in the format "XX:XX:XX:...".
 func calculateHash(data []byte, certHasher hash.Hash) string {
 	_, e := certHasher.Write(data)
 	if e != nil {
@@ -289,10 +313,13 @@ func calculateHash(data []byte, certHasher hash.Hash) string {
 	certHash = strings.ToUpper(certHash)
 
 	var result bytes.Buffer
+
+	//nolint:intrange
 	for i := 0; i < len(certHash); i++ {
 		if i%2 == 0 && i > 0 {
 			result.WriteByte(':')
 		}
+
 		c := certHash[i]
 		result.WriteByte(c)
 	}
@@ -402,12 +429,12 @@ func keyUsageToString(k x509.KeyUsage) string {
 }
 
 // ParseCertstreamEntry creates an Entry from a ct.RawLogEntry.
-func ParseCertstreamEntry(rawEntry *ct.RawLogEntry, operatorName, logname, ctURL string) (models.Entry, error) {
+func ParseCertstreamEntry(rawEntry *ct.RawLogEntry, operatorName, logname, ctURL, logType string) (models.Entry, error) {
 	if rawEntry == nil {
-		return models.Entry{}, errors.New("certstream entry is nil")
+		return models.Entry{}, ErrEntryNil
 	}
 
-	data, err := parseData(rawEntry, operatorName, logname, ctURL)
+	data, err := parseData(rawEntry, operatorName, logname, ctURL, logType)
 	if err != nil {
 		return models.Entry{}, err
 	}

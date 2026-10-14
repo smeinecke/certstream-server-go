@@ -23,17 +23,18 @@ func (e *Entry) Clone() Entry {
 	}
 }
 
-// JSON returns the json encoded Entry as byte slice and caches it for later access.
+// JSON returns the JSON encoded Entry as byte slice and caches it for later access.
 func (e *Entry) JSON() []byte {
 	if len(e.cachedJSON) > 0 {
 		return e.cachedJSON
 	}
+
 	e.cachedJSON = e.entryToJSONBytes()
 
 	return e.cachedJSON
 }
 
-// JSONNoCache returns the json encoded Entry as byte slice without caching it.
+// JSONNoCache returns the JSON encoded Entry as byte slice without caching it.
 func (e *Entry) JSONNoCache() []byte {
 	return e.entryToJSONBytes()
 }
@@ -43,6 +44,7 @@ func (e *Entry) JSONLite() []byte {
 	if len(e.cachedJSONLite) > 0 {
 		return e.cachedJSONLite
 	}
+
 	e.cachedJSONLite = e.JSONLiteNoCache()
 
 	return e.cachedJSONLite
@@ -57,7 +59,7 @@ func (e *Entry) JSONLiteNoCache() []byte {
 	return newEntry.entryToJSONBytes()
 }
 
-// JSONDomains returns the json encoded domains (DomainsEntry) as byte slice.
+// JSONDomains returns the JSON encoded domains (DomainsEntry) as byte slice.
 func (e *Entry) JSONDomains() []byte {
 	domainsEntry := DomainsEntry{
 		Data:        e.Data.LeafCert.AllDomains,
@@ -87,7 +89,7 @@ func (e *Entry) entryToJSONBytes() []byte {
 }
 
 type Data struct {
-	CertIndex  int64      `json:"cert_index"`
+	CertIndex  uint64     `json:"cert_index"`
 	CertLink   string     `json:"cert_link"`
 	Chain      []LeafCert `json:"chain,omitempty"`
 	LeafCert   LeafCert   `json:"leaf_cert"`
@@ -96,11 +98,18 @@ type Data struct {
 	UpdateType string     `json:"update_type"`
 }
 
+const (
+	SourceIsTiled   = "tiled"
+	SourceIsRFC6962 = "rfc6962"
+)
+
 type Source struct {
-	Name          string `json:"name"`
-	URL           string `json:"url"`
-	Operator      string `json:"-"`
-	NormalizedURL string `json:"-"`
+	Name          string  `json:"name"`
+	URL           string  `json:"url"`
+	Timestamp     float64 `json:"timestamp"`
+	Operator      string  `json:"-"`
+	NormalizedURL string  `json:"-"`
+	Type          string  `json:"type"`
 }
 
 type LeafCert struct {

@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: "3"
+
+tasks:
+  docker:
+    desc: Build a Docker image for your current OS and architecture.
+
+    cmds:
+      - docker build -t certstream-server-go:latest -f docker/Dockerfile.multistage .
+    silent: true
+
+  test:
+    desc: Run test suite.
+    cmds:
+      - go test -v ./...
+
+  run:
+    desc: Run the server binary.
+    cmds:
+      - go run ./cmd/certstream-server-go
+
+  build:
+    desc: Build the server binary for your current OS and architecture.
+    cmds:
+      - go build ./cmd/certstream-server-go
+
+  build-arm:
+    desc: Build the server binary for ARM architecture.
+    cmds:
+      - go build ./cmd/certstream-server-go
+    env:
+      GOARCH: arm64
+      GOOS: linux
+
+  lint:
+    desc: Run linters.
+    cmds:
+      - golangci-lint run --config .golangci.yml
+
+  update-deps:
+    desc: Update dependencies.
+    cmds:
+      - go get -u ./...
+      - go mod tidy

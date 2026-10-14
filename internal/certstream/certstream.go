@@ -5,11 +5,15 @@ package certstream
 // It also handles signals for graceful shutdown of the server.
 
 import (
+	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
+	"github.com/d-Rickyy-b/certstream-server-go/internal/broadcast"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/certificatetransparency"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/config"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/metrics"
@@ -17,49 +21,120 @@ import (
 )
 
 type Certstream struct {
-	webserver     *web.WebServer
-	metricsServer *web.WebServer
+	webserver     *web.Server
+	metricsServer *web.Server
 	watcher       *certificatetransparency.Watcher
 	config        config.Config
 }
 
-// NewCertstreamServer creates a new Certstream server from a config struct.
-func NewCertstreamServer(config config.Config) (*Certstream, error) {
+func NewRawCertstream(config config.Config) *Certstream {
 	cs := Certstream{}
 	cs.config = config
 
+	return &cs
+}
+
+// NewCertstreamServer creates a new Certstream server from a config struct.
+func NewCertstreamServer(cfg config.Config) (*Certstream, error) {
+	cs := NewRawCertstream(cfg)
+
+	// Start the broadcast dispatcher
+	broadcast.NewDispatcher()
+	broadcast.ClientHandler.Start()
+
+	// TODO: add support do disable websocket Server
 	// Initialize the webserver used for the websocket server
-	webserver := web.NewWebsocketServer(config.Webserver.ListenAddr, config.Webserver.ListenPort, config.Webserver.CertPath, config.Webserver.CertKeyPath)
+	webserver := web.NewWebsocketServer(
+		cfg.Webserver.ListenAddr,
+		cfg.Webserver.ListenPort,
+		cfg.Webserver.CertPath,
+		cfg.Webserver.CertKeyPath,
+	)
 	cs.webserver = webserver
+	cs.watcher = certificatetransparency.NewWatcher()
 
 	// Setup metrics server
 	cs.setupMetrics(webserver)
 
-	return &cs, nil
+	// Initialize the stream processors if configured and enabled.
+	for _, streamProcessor := range cfg.StreamProcessing {
+		if !*streamProcessor.Enabled {
+			continue
+		}
+
+		addr := net.JoinHostPort(streamProcessor.ServerAddr, strconv.Itoa(streamProcessor.ServerPort))
+		log.Printf("Initializing stream processor: %s at %s\n", streamProcessor.Name, addr)
+
+		var subscriptionType broadcast.SubscriptionType
+		switch streamProcessor.Stream {
+		case config.StreamTypeFull:
+			subscriptionType = broadcast.SubTypeFull
+		case config.StreamTypeLite:
+			subscriptionType = broadcast.SubTypeLite
+		case config.StreamTypeDomainsOnly:
+			subscriptionType = broadcast.SubTypeDomain
+		}
+
+		var c broadcast.CertProcessor
+		switch streamProcessor.Type {
+		case "nsq":
+			log.Println("Initializing NSQ client...")
+			c = broadcast.NewNSQClient(
+				subscriptionType,
+				addr,
+				streamProcessor.Name,
+				streamProcessor.Topic,
+				cfg.General.BufferSizes.Websocket,
+			)
+		case "kafka":
+			log.Println("Initializing Kafka client...")
+			c = broadcast.NewKafkaClient(
+				subscriptionType,
+				addr,
+				streamProcessor.Name,
+				streamProcessor.Topic,
+				string(streamProcessor.Compression),
+				cfg.General.BufferSizes.Websocket,
+			)
+		default:
+			log.Printf("Unknown stream processor type '%s' for %s. Skipping...\n", streamProcessor.Type, streamProcessor.Name)
+		}
+
+		log.Println(c)
+		broadcast.ClientHandler.RegisterClient(c)
+	}
+
+	return cs, nil
 }
 
 // NewCertstreamFromConfigFile creates a new Certstream server from a config file.
 func NewCertstreamFromConfigFile(configPath string) (*Certstream, error) {
 	conf, err := config.ReadConfig(configPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error reading config: %w", err)
 	}
 
 	return NewCertstreamServer(conf)
 }
 
 // setupMetrics configures the webserver to handle prometheus metrics according to the config.
-func (cs *Certstream) setupMetrics(webserver *web.WebServer) {
+func (cs *Certstream) setupMetrics(webserver *web.Server) {
 	if cs.config.Prometheus.Enabled {
 		// If prometheus is enabled, and interface is either unconfigured or same as webserver config, use existing webserver
 		if (cs.config.Prometheus.ListenAddr == "" || cs.config.Prometheus.ListenAddr == cs.config.Webserver.ListenAddr) &&
 			(cs.config.Prometheus.ListenPort == 0 || cs.config.Prometheus.ListenPort == cs.config.Webserver.ListenPort) {
 			log.Println("Starting prometheus server on same interface as webserver")
-			webserver.RegisterPrometheus(cs.config.Prometheus.MetricsURL, metrics.WritePrometheus)
+			webserver.RegisterPrometheus(cs.config.Prometheus.MetricsURL, metrics.Prometheus.Write)
 		} else {
 			log.Println("Starting prometheus server on new interface")
-			cs.metricsServer = web.NewMetricsServer(cs.config.Prometheus.ListenAddr, cs.config.Prometheus.ListenPort, cs.config.Prometheus.CertPath, cs.config.Prometheus.CertKeyPath)
-			cs.metricsServer.RegisterPrometheus(cs.config.Prometheus.MetricsURL, metrics.WritePrometheus)
+
+			cs.metricsServer = web.NewMetricsServer(
+				cs.config.Prometheus.ListenAddr,
+				cs.config.Prometheus.ListenPort,
+				cs.config.Prometheus.CertPath,
+				cs.config.Prometheus.CertKeyPath,
+			)
+			cs.metricsServer.RegisterPrometheus(cs.config.Prometheus.MetricsURL, metrics.Prometheus.Write)
 		}
 	}
 }
@@ -72,17 +147,19 @@ func (cs *Certstream) Start() {
 	// handle signals in a separate goroutine
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
 	go signalHandler(signals, cs.Stop)
 
 	// If there is no watcher initialized, create a new one
 	if cs.watcher == nil {
-		cs.watcher = &certificatetransparency.Watcher{}
+		cs.watcher = certificatetransparency.NewWatcher()
 	}
 
 	// Start webserver and metrics server
 	if cs.webserver == nil {
 		log.Fatalln("Webserver not initialized! Exiting...")
 	}
+
 	go cs.webserver.Start()
 
 	if cs.metricsServer != nil {
@@ -108,10 +185,27 @@ func (cs *Certstream) Stop() {
 	}
 }
 
+// CreateIndexFile creates the index file for the certificate transparency logs.
+// It gets only called when the CLI flag --create-index-file is set.
+func (cs *Certstream) CreateIndexFile(outFile string) error {
+	// If there is no watcher initialized, create a new one
+	if cs.watcher == nil {
+		cs.watcher = certificatetransparency.NewWatcher()
+	}
+
+	err := cs.watcher.CreateIndexFile(outFile)
+	if err != nil {
+		return fmt.Errorf("error creating index file: %w", err)
+	}
+
+	return nil
+}
+
 // signalHandler listens for signals in order to gracefully shut down the server.
 // Executes the callback function when a signal is received.
 func signalHandler(signals chan os.Signal, callback func()) {
 	log.Println("Listening for signals...")
+
 	sig := <-signals
 	log.Printf("Received signal %v. Shutting down...\n", sig)
 	callback()
