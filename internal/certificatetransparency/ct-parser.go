@@ -79,6 +79,12 @@ func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL, logType stri
 
 	// recalculate hashes if the certificate is a precertificate
 	if isPrecert {
+		// Tiled (static-CT) precerts carry only the TBSCertificate - Submitted.Data
+		// is empty there, so fall back to hashing the TBS bytes to avoid a
+		// constant empty-input fingerprint.
+		if len(rawData) == 0 {
+			rawData = cert.Raw
+		}
 		calculatedHash := calculateSHA1(rawData)
 		data.LeafCert.Fingerprint = calculatedHash
 		data.LeafCert.SHA1 = calculatedHash
