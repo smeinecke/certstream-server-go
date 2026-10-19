@@ -5,7 +5,9 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -50,16 +52,9 @@ type row struct {
 }
 
 type resultPage struct {
-	Query     string
-	Kind      string
-	Rows      []row
-	Truncated bool
-	NextAfter uint64
-	HaveNext  bool
-	After     uint64
-	Err       string
-	Elapsed   string
-	Base      string
+	Query string
+	Err   string
+	Base  string
 }
 
 // --- query parsing ---------------------------------------------------------
@@ -68,6 +63,12 @@ type parsed struct {
 	where string
 	args  []any
 	kind  string
+	// single marks predicates whose match set is inherently small (point
+	// lookups on bloom-indexed columns or the domain PK). Those run as one
+	// query - ORDER BY + LIMIT uses a bounded heap - instead of the
+	// two-phase index-then-fetch dance, which would scan the same granules
+	// twice.
+	single bool
 }
 
 func likeEsc(s string) string {
@@ -92,21 +93,21 @@ func parseQuery(q string) parsed {
 	switch {
 	case strings.HasPrefix(low, "fp:") || strings.HasPrefix(low, "fingerprint:"):
 		v := q[strings.Index(q, ":")+1:]
-		return parsed{`fingerprint = ?`, []any{v}, "fingerprint"}
+		return parsed{`fingerprint = ?`, []any{v}, "fingerprint", true}
 	case strings.HasPrefix(low, "serial:"):
-		return parsed{`serial_number = ?`, []any{q[7:]}, "serial"}
+		return parsed{`serial_number = ?`, []any{q[7:]}, "serial", true}
 	case strings.HasPrefix(low, "cn:"):
-		return parsed{`cn = ?`, []any{q[3:]}, "subject CN"}
+		return parsed{`cn = ?`, []any{q[3:]}, "subject CN", true}
 	case strings.HasPrefix(low, "idx:"):
 		n, _ := strconv.ParseUint(q[4:], 10, 64)
-		return parsed{`cert_index = ?`, []any{n}, "cert index"}
+		return parsed{`cert_index = ?`, []any{n}, "cert index", true}
 	}
 
 	if n, err := strconv.ParseUint(q, 10, 64); err == nil {
-		return parsed{`cert_index = ?`, []any{n}, "cert index"}
+		return parsed{`cert_index = ?`, []any{n}, "cert index", true}
 	}
 	if isHex64(q) {
-		return parsed{`fingerprint = ?`, []any{low}, "fingerprint"}
+		return parsed{`fingerprint = ?`, []any{low}, "fingerprint", true}
 	}
 
 	if strings.HasPrefix(q, "%.") || strings.HasPrefix(q, "*.") {
@@ -114,30 +115,22 @@ func parseQuery(q string) parsed {
 		return suffixQuery(suffix)
 	}
 	if strings.HasPrefix(q, "%") && len(q) > 1 {
-		pat := "%" + likeEsc(q[1:]) + `"%`
-		return parsed{`hostnames LIKE ?`, []any{pat}, "name suffix"}
+		// arbitrary suffix - no index can help, honest full scan
+		return parsed{`domain LIKE ?`, []any{"%" + likeEsc(q[1:])}, "name suffix", false}
 	}
-	// plain name: exact match on primary name OR inside the SAN list.
-	// root_domain IN (candidates) narrows the hostnames scan via skip index.
-	return parsed{
-		`domain = ? OR (root_domain IN (` + placeholders(rootCands(low)) + `) AND hostnames LIKE ?)`,
-		append(append([]any{low}, toAnys(rootCands(low))...), `%"`+likeEsc(low)+`"%`),
-		"exact identity",
-	}
+	// plain name: one row per SAN, so domain = ? covers every cert identity
+	return parsed{`domain = ?`, []any{low}, "exact identity", true}
 }
 
-// suffixQuery handles %.example.com - matches the suffix itself plus names
-// under it (crt.sh %.-semantics). root_domain IN (cands) drives granule
-// skipping; it only reflects the first SAN's root, so certs whose matching
-// names are secondary SANs under a different primary root are missed -
-// documented limitation of the schema.
+// suffixQuery handles %.example.com - the root_domain bloom index skips
+// granules, then endsWith on the surviving rows filters precisely.
+// Matches crt.sh %.x semantics: the suffix itself plus names under it.
 func suffixQuery(suffix string) parsed {
 	cands := rootCands(strings.ToLower(suffix))
-	s := likeEsc(suffix)
 	where := `root_domain IN (` + placeholders(cands) + `) AND ` +
-		`(domain = ? OR domain LIKE ? OR hostnames LIKE ? OR hostnames LIKE ?)`
-	args := append(toAnys(cands), suffix, "%."+s, `%"`+s+`"%`, "%."+s+`"%`)
-	return parsed{where, args, "subdomain names"}
+		`(domain = ? OR endsWith(domain, ?))`
+	args := append(toAnys(cands), suffix, "."+suffix)
+	return parsed{where, args, "subdomain names", false}
 }
 
 // rootCands returns the input and its first two label-stripped variants
@@ -157,6 +150,10 @@ func rootCands(name string) []string {
 
 func placeholders(v []string) string {
 	return strings.TrimSuffix(strings.Repeat("?,", len(v)), ",")
+}
+
+func phAny(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
 func toAnys(v []string) []any {
@@ -181,8 +178,7 @@ func isHex64(s string) bool {
 
 // --- http ------------------------------------------------------------------
 
-var tpl = template.Must(template.New("page").Funcs(
-	template.FuncMap{"ts": tsFormat, "urlquery": url.QueryEscape}).Parse(`<!DOCTYPE html>
+var headTpl = template.Must(template.New("head").Parse(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>ct search</title>
 <style>
 body{font-family:monospace;font-size:13px;margin:2em auto;max-width:1400px}
@@ -205,13 +201,10 @@ td.idx{white-space:nowrap}
 <p class="hint">
 %.example.com = subdomains &amp; wildcard &nbsp;&middot;&nbsp; example.com = exact name &nbsp;&middot;&nbsp;
 fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt;
-</p>
-{{if .Err}}<p class="err">{{.Err}}</p>{{end}}
-{{if .Rows}}
-<p>{{.Kind}}: {{len .Rows}} row(s){{if .Truncated}}+ (page limit){{end}} &nbsp; <span class="hint">{{.Elapsed}}</span></p>
-<table>
-<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th><th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>
-{{range .Rows}}<tr>
+</p>`))
+
+var rowTpl = template.Must(template.New("row").Funcs(
+	template.FuncMap{"ts": tsFormat}).Parse(`<tr>
 <td class="idx"><a href="cert/{{.Index}}">{{.Index}}</a></td>
 <td>{{.Seen.Format "2006-01-02"}}</td>
 <td>{{ts .NotBefore}}</td>
@@ -220,11 +213,13 @@ fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; id
 <td>{{.Hostnames}}</td>
 <td>{{.Serial}}</td>
 <td>{{.O}}</td>
-</tr>{{end}}
-</table>
-{{if .HaveNext}}<p><a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}">next page &rarr;</a></p>{{end}}
-{{end}}
-</body></html>`))
+</tr>
+`))
+
+var footTpl = template.Must(template.New("foot").Funcs(
+	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`</table>
+<p>{{.Kind}}: {{.Count}} row(s){{if .HaveNext}}+ (page limit){{end}} in {{.Elapsed}}
+{{if .HaveNext}}&nbsp; <a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}{{if .NextDom}}&amp;afterd={{urlquery .NextDom}}{{end}}">next page &rarr;</a>{{end}}</p>`))
 
 var certTpl = template.Must(template.New("cert").Funcs(
 	template.FuncMap{"ts": tsFormat}).Parse(`<!DOCTYPE html>
@@ -280,59 +275,161 @@ func tsFormat(v uint64) string {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
-	p := resultPage{Query: q, Base: base}
+	afterd := r.URL.Query().Get("afterd")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Accel-Buffering", "no") // let rows trickle through nginx
+	headTpl.Execute(w, struct{ Query, Base string }{q, base})
 	if q == "" {
-		tpl.Execute(w, p)
+		io.WriteString(w, "</body></html>")
 		return
 	}
+	fl, _ := w.(http.Flusher)
 	pq := parseQuery(q)
-	p.Kind = pq.kind
+	fmt.Fprintf(w, "<p>%s:</p>\n<table>\n"+
+		"<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
+		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n",
+		template.HTMLEscapeString(pq.kind))
+	if fl != nil {
+		fl.Flush() // show the table skeleton while the query scans
+	}
 
 	where := "(" + pq.where + ")"
-	if after > 0 {
-		where += " AND cert_index > ?"
-		pq.args = append(pq.args, after)
-	}
 	args := append([]any{}, pq.args...)
+	if after > 0 {
+		if pq.single && afterd != "" {
+			// row-level cursor: rows share cert_index across SANs, so a
+			// cert_index-only cursor would drop siblings at the boundary
+			where += " AND (cert_index, domain) > (?, ?)"
+			args = append(args, after, afterd)
+		} else {
+			where += " AND cert_index > ?"
+			args = append(args, after)
+		}
+	}
+	args = append(args, *flagLimit+1)
 
 	start := time.Now()
-	rows, err := chConn.Query(r.Context(),
-		`SELECT cert_index, timestamp, not_before, not_after, cn, domain, serial_number, o, hostnames
-		 FROM `+flagDBOr()+`.`+flagTableOr()+`
-		 WHERE `+where+`
-		 ORDER BY cert_index ASC
-		 LIMIT ?`, append(args, *flagLimit+1)...)
-	if err != nil {
-		p.Err = err.Error()
-		tpl.Execute(w, p)
-		return
-	}
-	defer rows.Close()
+	var qErr string
+	var count int
+	var lastIdx uint64
+	var lastDom string
+	haveNext := false
 
-	for rows.Next() {
-		var rw row
-		if err := rows.Scan(&rw.Index, &rw.Seen, &rw.NotBefore, &rw.NotAfter,
-			&rw.CN, &rw.Domain, &rw.Serial, &rw.O, &rw.Hostnames); err != nil {
-			p.Err = "scan: " + err.Error()
-			tpl.Execute(w, p)
-			return
+	const cols = `cert_index, timestamp, not_before, not_after, cn, domain, serial_number, o, hostnames`
+	emit := func(rows driver.Rows, capRows bool) {
+		defer rows.Close()
+		for rows.Next() {
+			var rw row
+			if err := rows.Scan(&rw.Index, &rw.Seen, &rw.NotBefore, &rw.NotAfter,
+				&rw.CN, &rw.Domain, &rw.Serial, &rw.O, &rw.Hostnames); err != nil {
+				qErr = "scan: " + err.Error()
+				return
+			}
+			if capRows && count == *flagLimit {
+				haveNext = true // extra row only signals the next page
+				continue
+			}
+			lastIdx, lastDom = rw.Index, rw.Domain
+			rw.Hostnames = shortNames(rw.Hostnames, 200)
+			rowTpl.Execute(w, rw)
+			count++
+			if fl != nil && count%16 == 0 {
+				fl.Flush()
+			}
 		}
-		rw.Hostnames = shortNames(rw.Hostnames, 200)
-		p.Rows = append(p.Rows, rw)
+		if qErr == "" {
+			if err := rows.Err(); err != nil {
+				qErr = err.Error()
+			}
+		}
 	}
-	if err := rows.Err(); err != nil {
-		p.Err = err.Error()
-		tpl.Execute(w, p)
-		return
+
+	if pq.single {
+		// bounded match set - ORDER BY+LIMIT keeps a small heap server-side,
+		// and one scan beats find-indexes-then-refetch on the same granules
+		rows, err := chConn.Query(r.Context(),
+			`SELECT `+cols+` FROM `+flagDBOr()+`.`+flagTableOr()+`
+			 WHERE `+where+` ORDER BY cert_index, domain LIMIT ?`, args...)
+		if err != nil {
+			qErr = err.Error()
+		} else {
+			emit(rows, true)
+		}
+	} else {
+		// Phase 1: pick matching cert_index values (sorts only UInt64s - the
+		// ORDER BY over giant hostnames strings blows server memory otherwise)
+		idxRows, err := chConn.Query(r.Context(),
+			`SELECT cert_index FROM `+flagDBOr()+`.`+flagTableOr()+`
+			 WHERE `+where+`
+			 ORDER BY cert_index ASC
+			 LIMIT ?`, args...)
+		var indexes []uint64
+		if err != nil {
+			qErr = err.Error()
+		} else {
+			for idxRows.Next() {
+				var ix uint64
+				if err := idxRows.Scan(&ix); err != nil {
+					qErr = "scan: " + err.Error()
+					break
+				}
+				if len(indexes) == 0 || indexes[len(indexes)-1] != ix {
+					indexes = append(indexes, ix)
+				}
+			}
+			if qErr == "" {
+				if err := idxRows.Err(); err != nil {
+					qErr = err.Error()
+				}
+			}
+			idxRows.Close()
+		}
+		if qErr == "" && len(indexes) > *flagLimit {
+			haveNext = true
+			indexes = indexes[:*flagLimit]
+		}
+		if len(indexes) > 0 {
+			lastIdx = indexes[len(indexes)-1]
+		}
+
+		// Phase 2: fetch the display columns for just those indices via the
+		// cert_index bloom index - bounded, near-point lookups
+		if qErr == "" && len(indexes) > 0 {
+			// inline the uint64 list - parameter binds are not 'constant' for IN
+			var sb strings.Builder
+			for i, v := range indexes {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(strconv.FormatUint(v, 10))
+			}
+			rows, err := chConn.Query(r.Context(),
+				`SELECT `+cols+` FROM `+flagDBOr()+`.`+flagTableOr()+`
+				 WHERE cert_index IN (`+sb.String()+`)
+				 ORDER BY cert_index, domain`)
+			if err != nil {
+				qErr = err.Error()
+			} else {
+				// all rows of the selected indexes belong to this page -
+				// the index count already limited it
+				emit(rows, false)
+			}
+		}
 	}
-	if len(p.Rows) > *flagLimit {
-		p.Rows = p.Rows[:*flagLimit]
-		p.Truncated = true
-		p.HaveNext = true
-		p.NextAfter = p.Rows[len(p.Rows)-1].Index
+	if qErr != "" {
+		fmt.Fprintf(w, `</table><p class="err">%s</p>`, template.HTMLEscapeString(qErr))
+	} else {
+		footTpl.Execute(w, struct {
+			Kind      string
+			Count     int
+			HaveNext  bool
+			NextAfter uint64
+			NextDom   string
+			Elapsed   string
+			Query     string
+		}{pq.kind, count, haveNext, lastIdx, lastDom, time.Since(start).String(), q})
 	}
-	p.Elapsed = time.Since(start).String()
-	tpl.Execute(w, p)
+	io.WriteString(w, "</body></html>")
 }
 
 func shortNames(js string, max int) string {
@@ -351,7 +448,8 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	tpl.Execute(w, resultPage{Base: base})
+	headTpl.Execute(w, struct{ Query, Base string }{"", base})
+	io.WriteString(w, "</body></html>")
 }
 
 func certHandler(w http.ResponseWriter, r *http.Request) {
