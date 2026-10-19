@@ -25,6 +25,7 @@ var (
 	flagDSN        = flag.String("clickhouse-dsn", "127.0.0.1:9000", "clickhouse host:port (native protocol)")
 	flagDB         = flag.String("clickhouse-db", "certstream", "clickhouse database")
 	flagTable      = flag.String("clickhouse-table", "certs", "clickhouse table")
+	flagIdxTable   = flag.String("clickhouse-idx-table", "certs_idx", "cert_index->domain lookup table (empty = direct scan)")
 	flagUser       = flag.String("clickhouse-user", "ctscan", "clickhouse user")
 	flagCHPassFile = flag.String("clickhouse-password-file", "", "file containing the clickhouse password")
 	flagCHPass     = flag.String("clickhouse-password", "", "clickhouse password")
@@ -100,11 +101,11 @@ func parseQuery(q string) parsed {
 		return parsed{`cn = ?`, []any{q[3:]}, "subject CN", true}
 	case strings.HasPrefix(low, "idx:"):
 		n, _ := strconv.ParseUint(q[4:], 10, 64)
-		return parsed{`cert_index = ?`, []any{n}, "cert index", true}
+		return idxPred(n)
 	}
 
 	if n, err := strconv.ParseUint(q, 10, 64); err == nil {
-		return parsed{`cert_index = ?`, []any{n}, "cert index", true}
+		return idxPred(n)
 	}
 	if isHex64(q) {
 		return parsed{`fingerprint = ?`, []any{low}, "fingerprint", true}
@@ -118,8 +119,31 @@ func parseQuery(q string) parsed {
 		// arbitrary suffix - no index can help, honest full scan
 		return parsed{`domain LIKE ?`, []any{"%" + likeEsc(q[1:])}, "name suffix", false}
 	}
+	if strings.ContainsAny(q, "%*") {
+		// wildcard anywhere else: * and % are wildcards, _ and \ escape.
+		// a literal prefix makes it a PK range scan (single phase);
+		// a leading wildcard (handled above) stays two-phase.
+		pat := strings.ReplaceAll(low, "*", "%")
+		pat = strings.ReplaceAll(pat, `\`, `\\`)
+		pat = strings.ReplaceAll(pat, `_`, `\_`)
+		return parsed{`domain LIKE ?`, []any{pat}, "name pattern", true}
+	}
 	// plain name: one row per SAN, so domain = ? covers every cert identity
 	return parsed{`domain = ?`, []any{low}, "exact identity", true}
+}
+
+// idxPred builds the cert_index predicate. With the certs_idx lookup
+// table the outer query only touches granules whose domain is one of the
+// few SAN names of that cert (PK seek) instead of bloom-scanning every
+// granule in the table.
+func idxPred(n uint64) parsed {
+	if idxTbl := flagIdxOr(); idxTbl != "" {
+		w := fmt.Sprintf(
+			`domain IN (SELECT domain FROM %s WHERE cert_index = %d) AND cert_index = %d`,
+			idxTbl, n, n)
+		return parsed{w, nil, "cert index", true}
+	}
+	return parsed{`cert_index = ?`, []any{n}, "cert index", true}
 }
 
 // suffixQuery handles %.example.com - the root_domain bloom index skips
@@ -191,6 +215,11 @@ a{color:#005}
 .err{color:#a00}
 .hint{color:#666}
 td.idx{white-space:nowrap}
+#ld{margin:1em 0;padding:.5em .8em;background:#ffc;border:1px solid #cc6}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid #999;
+border-top-color:#222;border-radius:50%;animation:sp .8s linear infinite;
+vertical-align:-2px;margin-right:.4em}
+@keyframes sp{to{transform:rotate(360deg)}}
 </style>
 <base href="{{.Base}}"></head><body>
 <h3>ct search</h3>
@@ -199,7 +228,8 @@ td.idx{white-space:nowrap}
 <input type="submit" value="Search">
 </form>
 <p class="hint">
-%.example.com = subdomains &amp; wildcard &nbsp;&middot;&nbsp; example.com = exact name &nbsp;&middot;&nbsp;
+%.example.com = subdomains &nbsp;&middot;&nbsp; example.com = exact name &nbsp;&middot;&nbsp;
+% and * wildcards anywhere (foo%) &nbsp;&middot;&nbsp;
 fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt;
 </p>`))
 
@@ -285,10 +315,16 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	fl, _ := w.(http.Flusher)
 	pq := parseQuery(q)
-	fmt.Fprintf(w, "<p>%s:</p>\n<table>\n"+
-		"<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
-		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n",
-		template.HTMLEscapeString(pq.kind))
+	fmt.Fprintf(w, "<p>%s:</p>\n", template.HTMLEscapeString(pq.kind))
+	io.WriteString(w, `<div id="ld"><span class="spin"></span>`+
+		`querying clickhouse&hellip; <span id="elt">0.0</span>s`+
+		` &mdash; rows stream in below</div>`+"\n"+
+		`<script>var _t0=Date.now(),_tm=setInterval(function(){`+
+		`var e=document.getElementById('elt');`+
+		`if(!e){clearInterval(_tm);return}`+
+		`e.textContent=((Date.now()-_t0)/1000).toFixed(1)},100);</script>`+"\n"+
+		"<table>\n<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
+		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n")
 	if fl != nil {
 		fl.Flush() // show the table skeleton while the query scans
 	}
@@ -429,6 +465,8 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			Query     string
 		}{pq.kind, count, haveNext, lastIdx, lastDom, time.Since(start).String(), q})
 	}
+	io.WriteString(w, `<script>clearInterval(_tm);`+
+		`var _l=document.getElementById('ld');if(_l)_l.remove();</script>`)
 	io.WriteString(w, "</body></html>")
 }
 
@@ -475,13 +513,14 @@ func certHandler(w http.ResponseWriter, r *http.Request) {
 		ts                                                                                                  time.Time
 		cn, o, l, st, c, ou, email, hn, san, ser, fp, alg, aki, ski, aia, ku, eku, bc, cp, sct, tld, rd, cl string
 	)
+	pw := idxPred(n)
 	row := chConn.QueryRow(r.Context(),
 		`SELECT cert_index, timestamp, not_before, not_after, cn, o, l, st, c, ou,
 		        email_address, hostnames, subject_alt_name, serial_number, fingerprint,
 		        signature_algorithm, authority_key_identifier, subject_key_identifier,
 		        authority_info_access, key_usage, extended_key_usage, basic_constraints,
 		        certificate_policies, ctl_signed_certificate_timestamp, tld, root_domain, cert_link
-		 FROM `+flagDBOr()+`.`+flagTableOr()+` WHERE cert_index = ? LIMIT 1`, n)
+		 FROM `+flagDBOr()+`.`+flagTableOr()+` WHERE `+pw.where+` LIMIT 1`, pw.args...)
 	if err := row.Scan(&p.Index, &ts, &nb, &na, &cn, &o, &l, &st, &c, &ou,
 		&email, &hn, &san, &ser, &fp, &alg, &aki, &ski, &aia, &ku, &eku, &bc,
 		&cp, &sct, &tld, &rd, &cl); err != nil {
@@ -506,6 +545,12 @@ func certHandler(w http.ResponseWriter, r *http.Request) {
 
 func flagDBOr() string    { return *flagDB }
 func flagTableOr() string { return *flagTable }
+func flagIdxOr() string {
+	if *flagIdxTable == "" {
+		return ""
+	}
+	return flagDBOr() + "." + *flagIdxTable
+}
 
 func main() {
 	flag.Parse()
