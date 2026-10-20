@@ -445,7 +445,12 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 				haveNext = true // extra row only signals the next page
 				continue
 			}
-			lastIdx, lastDom = rw.Index, rw.Domain
+			// phase-2 emits rows unsorted - the cursor must track the max
+			// index seen (with its last-seen domain for the row-level
+			// tiebreak), not whatever row happened to arrive last
+			if rw.Index >= lastIdx {
+				lastIdx, lastDom = rw.Index, rw.Domain
+			}
 			rw.Hostnames = shortNames(rw.Hostnames, 200)
 			emitRow(rw)
 			count++
@@ -546,10 +551,15 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 				pred = `domain IN (SELECT domain FROM ` + idxTbl +
 					` WHERE cert_index IN (` + sb.String() + `)) AND ` + pred
 			}
+			// re-apply the user's predicate: each row is one SAN, and a cert
+			// covering both the searched name and unrelated SANs would else
+			// show those siblings too. No ORDER BY - sorting would make CH
+			// buffer every row before emitting the first; granule order is
+			// fine and lets rows stream out as they are read.
+			pred = where + ` AND ` + pred
 			rows, err := chConn.Query(qctx,
 				`SELECT `+cols+` FROM `+flagDBOr()+`.`+flagTableOr()+`
-				 WHERE `+pred+`
-				 ORDER BY cert_index, domain`)
+				 WHERE `+pred, args[:len(args)-1]...)
 			if err != nil {
 				qErr = err.Error()
 			} else {
