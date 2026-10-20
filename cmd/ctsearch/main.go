@@ -135,10 +135,21 @@ func parseQuery(q string) parsed {
 		}
 		return suffixQuery(suffix)
 	}
-	if strings.HasPrefix(q, "%") && len(q) > 1 {
-		// arbitrary suffix - no index can help, honest full scan
-		return parsed{`domain LIKE ?`, []any{"%" + likeEsc(q[1:])}, "name suffix", false,
-			`endsWith(domain, ?)`, []any{q[1:]}}
+	if strings.HasPrefix(q, "%") || strings.HasPrefix(q, "*") {
+		rest := q[1:]
+		if strings.ContainsAny(rest, "%*") {
+			// leading wildcard + more wildcards: substring match.
+			// user-typed % and * stay wildcards; \ and _ are escaped
+			pat := strings.ReplaceAll(strings.ToLower(rest), "*", "%")
+			pat = strings.ReplaceAll(pat, `\`, `\\`)
+			pat = strings.ReplaceAll(pat, `_`, `\_`)
+			return parsed{`domain LIKE ?`, []any{"%" + pat}, "name substring", false,
+				`domain LIKE ?`, []any{"%" + pat}}
+		}
+		// plain leading wildcard: domain suffix - no PK prefix to seek on,
+		// but certs_idx's ngram index skips granules that lack the trigrams
+		return parsed{`domain LIKE ?`, []any{"%" + likeEsc(strings.ToLower(rest))},
+			"name suffix", false, `endsWith(domain, ?)`, []any{strings.ToLower(rest)}}
 	}
 	if strings.ContainsAny(q, "%*") {
 		// wildcard anywhere else: * and % are wildcards, _ and \ escape.
@@ -178,11 +189,19 @@ func idxPred(n uint64) parsed {
 // plus names under it.
 func suffixQuery(suffix string) parsed {
 	suffix = strings.ToLower(suffix)
-	cands := rootCands(suffix)
+	// root_domain is always the last two labels, so the bloom prefilter
+	// needs exactly one candidate: the last two labels of the suffix.
+	// (rootCands' guessing misses for suffixes deeper than 3 labels.)
+	root := suffix
+	if i := strings.LastIndex(suffix, "."); i >= 0 {
+		if j := strings.LastIndex(suffix[:i], "."); j >= 0 {
+			root = suffix[j+1:]
+		}
+	}
 	rev := likeEsc(revStr(suffix))
-	where := `root_domain IN (` + placeholders(cands) + `) AND ` +
+	where := `root_domain = ? AND ` +
 		`(domain_rev = ? OR domain_rev LIKE ?)`
-	args := append(toAnys(cands), rev, rev+".%")
+	args := []any{root, rev, rev + ".%"}
 	// no p1where: rare suffixes early-terminate badly on certs_idx since it
 	// is ordered by cert_index - a sparse match forces a full-table scan.
 	// root_domain's bloom index on the wide table prunes far better here.
