@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,6 +32,7 @@ var (
 	flagCHPass     = flag.String("clickhouse-password", "", "clickhouse password")
 	flagBase       = flag.String("base", "/ct/", "URL base path the app is mounted under")
 	flagLimit      = flag.Int("limit", 100, "rows per page")
+	flagQTimeout   = flag.Duration("query-timeout", 285*time.Second, "per-query timeout - keep under the proxy read timeout so errors render")
 )
 
 var chConn driver.Conn
@@ -346,6 +348,11 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(args, *flagLimit+1)
 
+	// bound the total query time below the proxy read timeout so a timeout
+	// error can still be rendered on the page (and the spinner removed)
+	qctx, qcancel := context.WithTimeout(r.Context(), *flagQTimeout)
+	defer qcancel()
+
 	start := time.Now()
 	var qErr string
 	var count int
@@ -385,7 +392,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	if pq.single {
 		// bounded match set - ORDER BY+LIMIT keeps a small heap server-side,
 		// and one scan beats find-indexes-then-refetch on the same granules
-		rows, err := chConn.Query(r.Context(),
+		rows, err := chConn.Query(qctx,
 			`SELECT `+cols+` FROM `+flagDBOr()+`.`+flagTableOr()+`
 			 WHERE `+where+` ORDER BY cert_index, domain LIMIT ?`, args...)
 		if err != nil {
@@ -396,7 +403,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Phase 1: pick matching cert_index values (sorts only UInt64s - the
 		// ORDER BY over giant hostnames strings blows server memory otherwise)
-		idxRows, err := chConn.Query(r.Context(),
+		idxRows, err := chConn.Query(qctx,
 			`SELECT cert_index FROM `+flagDBOr()+`.`+flagTableOr()+`
 			 WHERE `+where+`
 			 ORDER BY cert_index ASC
@@ -448,7 +455,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 				pred = `domain IN (SELECT domain FROM ` + idxTbl +
 					` WHERE cert_index IN (` + sb.String() + `)) AND ` + pred
 			}
-			rows, err := chConn.Query(r.Context(),
+			rows, err := chConn.Query(qctx,
 				`SELECT `+cols+` FROM `+flagDBOr()+`.`+flagTableOr()+`
 				 WHERE `+pred+`
 				 ORDER BY cert_index, domain`)
@@ -462,6 +469,9 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if qErr != "" {
+		if qctx.Err() == context.DeadlineExceeded {
+			qErr = fmt.Sprintf("query exceeded the %s server-side budget - too broad or too much load; try a narrower name", flagQTimeout)
+		}
 		fmt.Fprintf(w, `</table></div><p class="err">%s</p>`, template.HTMLEscapeString(qErr))
 	} else {
 		footTpl.Execute(w, struct {
@@ -523,7 +533,9 @@ func certHandler(w http.ResponseWriter, r *http.Request) {
 		cn, o, l, st, c, ou, email, hn, san, ser, fp, alg, aki, ski, aia, ku, eku, bc, cp, sct, tld, rd, cl string
 	)
 	pw := idxPred(n)
-	row := chConn.QueryRow(r.Context(),
+	qctx, qcancel := context.WithTimeout(r.Context(), *flagQTimeout)
+	defer qcancel()
+	row := chConn.QueryRow(qctx,
 		`SELECT cert_index, timestamp, not_before, not_after, cn, o, l, st, c, ou,
 		        email_address, hostnames, subject_alt_name, serial_number, fingerprint,
 		        signature_algorithm, authority_key_identifier, subject_key_identifier,
