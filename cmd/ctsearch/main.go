@@ -72,6 +72,13 @@ type parsed struct {
 	// two-phase index-then-fetch dance, which would scan the same granules
 	// twice.
 	single bool
+	// p1where/p1args optionally give a domain-only predicate evaluated
+	// against certs_idx in phase 1. The narrow (cert_index, domain) table
+	// is ~3x cheaper to scan than the wide certs table, and its sort order
+	// lets ORDER BY cert_index early-terminate at the LIMIT. Only set for
+	// two-phase queries whose predicate touches domain columns alone.
+	p1where string
+	p1args  []any
 }
 
 func likeEsc(s string) string {
@@ -96,11 +103,11 @@ func parseQuery(q string) parsed {
 	switch {
 	case strings.HasPrefix(low, "fp:") || strings.HasPrefix(low, "fingerprint:"):
 		v := q[strings.Index(q, ":")+1:]
-		return parsed{`fingerprint = ?`, []any{v}, "fingerprint", true}
+		return parsed{`fingerprint = ?`, []any{v}, "fingerprint", true, "", nil}
 	case strings.HasPrefix(low, "serial:"):
-		return parsed{`serial_number = ?`, []any{q[7:]}, "serial", true}
+		return parsed{`serial_number = ?`, []any{q[7:]}, "serial", true, "", nil}
 	case strings.HasPrefix(low, "cn:"):
-		return parsed{`cn = ?`, []any{q[3:]}, "subject CN", true}
+		return parsed{`cn = ?`, []any{q[3:]}, "subject CN", true, "", nil}
 	case strings.HasPrefix(low, "idx:"):
 		n, _ := strconv.ParseUint(q[4:], 10, 64)
 		return idxPred(n)
@@ -110,16 +117,27 @@ func parseQuery(q string) parsed {
 		return idxPred(n)
 	}
 	if isHex64(q) {
-		return parsed{`fingerprint = ?`, []any{low}, "fingerprint", true}
+		return parsed{`fingerprint = ?`, []any{low}, "fingerprint", true, "", nil}
 	}
 
 	if strings.HasPrefix(q, "%.") || strings.HasPrefix(q, "*.") {
 		suffix := strings.TrimPrefix(strings.TrimPrefix(q, "%."), "*.")
+		if !strings.Contains(suffix, ".") {
+			// bare TLD (%.de) - 'de' is a public suffix, never an eTLD+1, so
+			// root_domain can't help; tld='de' covers it on the main table.
+			// Phase-1 scans certs_idx's narrow domain column instead.
+			sfx := "." + strings.ToLower(suffix)
+			return parsed{
+				`tld = ?`, []any{strings.ToLower(suffix)}, "TLD suffix", false,
+				`endsWith(domain, ?)`, []any{sfx},
+			}
+		}
 		return suffixQuery(suffix)
 	}
 	if strings.HasPrefix(q, "%") && len(q) > 1 {
 		// arbitrary suffix - no index can help, honest full scan
-		return parsed{`domain LIKE ?`, []any{"%" + likeEsc(q[1:])}, "name suffix", false}
+		return parsed{`domain LIKE ?`, []any{"%" + likeEsc(q[1:])}, "name suffix", false,
+			`endsWith(domain, ?)`, []any{q[1:]}}
 	}
 	if strings.ContainsAny(q, "%*") {
 		// wildcard anywhere else: * and % are wildcards, _ and \ escape.
@@ -128,10 +146,12 @@ func parseQuery(q string) parsed {
 		pat := strings.ReplaceAll(low, "*", "%")
 		pat = strings.ReplaceAll(pat, `\`, `\\`)
 		pat = strings.ReplaceAll(pat, `_`, `\_`)
-		return parsed{`domain LIKE ?`, []any{pat}, "name pattern", true}
+		return parsed{`domain LIKE ?`, []any{pat}, "name pattern", true, "", nil}
 	}
-	// plain name: one row per SAN, so domain = ? covers every cert identity
-	return parsed{`domain = ?`, []any{low}, "exact identity", true}
+	// plain name: root_domain = ? covers apex + all subdomains (apex rows
+	// have root_domain = themselves) - single bloom-indexed predicate.
+	// An OR with domain = ? here would defeat granule pruning entirely.
+	return parsed{`root_domain = ?`, []any{low}, "domain + subdomains", true, "", nil}
 }
 
 // idxPred builds the cert_index predicate. With the certs_idx lookup
@@ -143,20 +163,35 @@ func idxPred(n uint64) parsed {
 		w := fmt.Sprintf(
 			`domain IN (SELECT domain FROM %s WHERE cert_index = %d) AND cert_index = %d`,
 			idxTbl, n, n)
-		return parsed{w, nil, "cert index", true}
+		return parsed{w, nil, "cert index", true, "", nil}
 	}
-	return parsed{`cert_index = ?`, []any{n}, "cert index", true}
+	return parsed{`cert_index = ?`, []any{n}, "cert index", true, "", nil}
 }
 
 // suffixQuery handles %.example.com - the root_domain bloom index skips
-// granules, then endsWith on the surviving rows filters precisely.
-// Matches crt.sh %.x semantics: the suffix itself plus names under it.
+// granules, then a prefix match on the materialized reverse(domain)
+// filters precisely. Matches crt.sh %.x semantics: the suffix itself
+// plus names under it.
 func suffixQuery(suffix string) parsed {
-	cands := rootCands(strings.ToLower(suffix))
+	suffix = strings.ToLower(suffix)
+	cands := rootCands(suffix)
+	rev := likeEsc(revStr(suffix))
 	where := `root_domain IN (` + placeholders(cands) + `) AND ` +
-		`(domain = ? OR endsWith(domain, ?))`
-	args := append(toAnys(cands), suffix, "."+suffix)
-	return parsed{where, args, "subdomain names", false}
+		`(domain_rev = ? OR domain_rev LIKE ?)`
+	args := append(toAnys(cands), rev, rev+".%")
+	// no p1where: rare suffixes early-terminate badly on certs_idx since it
+	// is ordered by cert_index - a sparse match forces a full-table scan.
+	// root_domain's bloom index on the wide table prunes far better here.
+	return parsed{where, args, "subdomain names", false, "", nil}
+}
+
+// revStr reverses a domain string: "x.example.com" -> "moc.elpmaxe.x"
+func revStr(s string) string {
+	b := []byte(s)
+	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+		b[i], b[j] = b[j], b[i]
+	}
+	return string(b)
 }
 
 // rootCands returns the input and its first two label-stripped variants
@@ -403,11 +438,26 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Phase 1: pick matching cert_index values (sorts only UInt64s - the
 		// ORDER BY over giant hostnames strings blows server memory otherwise)
+		p1table := flagDBOr() + "." + flagTableOr()
+		p1where, p1args := where, args
+		if pq.p1where != "" && flagIdxOr() != "" {
+			// domain-only predicates scan the narrow certs_idx instead - its
+			// (cert_index, domain) sort order also lets ORDER BY cert_index
+			// early-terminate at the LIMIT
+			p1table = flagIdxOr()
+			p1where = "(" + pq.p1where + ")"
+			p1args = append([]any{}, pq.p1args...)
+			if after > 0 {
+				p1where += " AND cert_index > ?"
+				p1args = append(p1args, after)
+			}
+			p1args = append(p1args, *flagLimit+1)
+		}
 		idxRows, err := chConn.Query(qctx,
-			`SELECT cert_index FROM `+flagDBOr()+`.`+flagTableOr()+`
-			 WHERE `+where+`
+			`SELECT cert_index FROM `+p1table+`
+			 WHERE `+p1where+`
 			 ORDER BY cert_index ASC
-			 LIMIT ?`, args...)
+			 LIMIT ?`, p1args...)
 		var indexes []uint64
 		if err != nil {
 			qErr = err.Error()
