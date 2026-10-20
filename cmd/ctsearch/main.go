@@ -401,9 +401,20 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // runSearch executes the parsed query and calls emitRow per display
-// row. Returns the error text, row count, and pagination cursor.
+// row; emitStatus (may be nil) reports phase progress for streamed UIs.
+// Returns the error text, row count, and pagination cursor.
 func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
-	emitRow func(row)) (qErr string, count int, haveNext bool, lastIdx uint64, lastDom string) {
+	emitRow func(row), emitStatus func(string)) (qErr string, count int, haveNext bool, lastIdx uint64, lastDom string) {
+
+	var lastSt time.Time
+	status := func(s string) {
+		// throttle to one update per 2s - scans emit no rows, so these
+		// are the only signs of life during a long phase-1
+		if emitStatus != nil && time.Since(lastSt) > 2*time.Second {
+			emitStatus(s)
+			lastSt = time.Now()
+		}
+	}
 
 	where := "(" + pq.where + ")"
 	args := append([]any{}, pq.args...)
@@ -449,6 +460,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 	if pq.single {
 		// bounded match set - ORDER BY+LIMIT keeps a small heap server-side,
 		// and one scan beats find-indexes-then-refetch on the same granules
+		status("single scan running")
 		rows, err := chConn.Query(qctx,
 			`SELECT `+cols+` FROM `+flagDBOr()+`.`+flagTableOr()+`
 			 WHERE `+where+` ORDER BY cert_index, domain LIMIT ?`, args...)
@@ -475,6 +487,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 			}
 			p1args = append(p1args, *flagLimit+1)
 		}
+		status("phase 1: finding matching cert_index values")
 		idxRows, err := chConn.Query(qctx,
 			`SELECT cert_index FROM `+p1table+`
 			 WHERE `+p1where+`
@@ -513,6 +526,12 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 		// through certs_idx when configured: the (cert_index, domain) lookup
 		// turns this into domain-PK seeks instead of a wide-table bloom
 		// rescan on cert_index.
+		if qErr == "" {
+			if emitStatus != nil {
+				emitStatus(fmt.Sprintf(
+					"phase 2: fetching %d certificate(s)", len(indexes)))
+			}
+		}
 		if qErr == "" && len(indexes) > 0 {
 			// inline the uint64 list - parameter binds are not 'constant' for IN
 			var sb strings.Builder
@@ -581,7 +600,7 @@ func searchShell(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<p>%s:</p>\n", template.HTMLEscapeString(pq.kind))
 	io.WriteString(w, `<div id="ld"><span class="spin"></span>`+
 		`querying clickhouse&hellip; <span id="elt">0.0</span>s`+
-		` &mdash; rows stream in below</div>`+"\n"+
+		` &mdash; <span id="st">starting</span></div>`+"\n"+
 		`<div class="tw" id="tw"><table>`+"\n<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
 		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n<tbody id=\"rt\"></tbody></table></div>\n"+
 		`<script>var _t0=Date.now(),_tm=setInterval(function(){`+
@@ -593,6 +612,8 @@ func searchShell(w http.ResponseWriter, r *http.Request) {
 		`function fin(){clearInterval(_tm);var l=document.getElementById('ld');`+
 		`if(l)l.remove();es.close();}`+
 		`es.addEventListener('row',function(e){tb.insertAdjacentHTML('beforeend',e.data)});`+
+		`es.addEventListener('status',function(e){`+
+		`var s=document.getElementById('st');if(s)s.textContent=e.data});`+
 		`es.addEventListener('end',function(e){`+
 		`tw.insertAdjacentHTML('afterend',e.data);fin()});`+
 		`es.addEventListener('err',function(e){`+
@@ -634,7 +655,8 @@ func searchSSE(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd,
-		func(rw row) { sse.send("row", tplStr(rowTpl, rw)) })
+		func(rw row) { sse.send("row", tplStr(rowTpl, rw)) },
+		func(s string) { sse.send("status", s) })
 	if qErr != "" {
 		sse.send("err", qErr)
 		return
@@ -674,7 +696,7 @@ func searchInline(w http.ResponseWriter, r *http.Request) {
 			if n++; fl != nil && n%16 == 0 {
 				fl.Flush()
 			}
-		})
+		}, nil)
 
 	if qErr != "" {
 		fmt.Fprintf(w, `</table></div><p class="err">%s</p>`, template.HTMLEscapeString(qErr))
