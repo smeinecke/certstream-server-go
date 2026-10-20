@@ -73,6 +73,9 @@ type parsed struct {
 	// two-phase index-then-fetch dance, which would scan the same granules
 	// twice.
 	single bool
+	// names marks distinct-name aggregation queries (names:x) answered by
+	// GROUP BY domain on certs_idx.
+	names bool
 	// p1where/p1args optionally give a domain-only predicate evaluated
 	// against certs_idx in phase 1. The narrow (cert_index, domain) table
 	// is ~3x cheaper to scan than the wide certs table, and its sort order
@@ -104,21 +107,23 @@ func parseQuery(q string) parsed {
 	switch {
 	case strings.HasPrefix(low, "fp:") || strings.HasPrefix(low, "fingerprint:"):
 		v := q[strings.Index(q, ":")+1:]
-		return parsed{`fingerprint = ?`, []any{v}, "fingerprint", true, "", nil}
+		return parsed{`fingerprint = ?`, []any{v}, "fingerprint", true, false, "", nil}
 	case strings.HasPrefix(low, "serial:"):
-		return parsed{`serial_number = ?`, []any{q[7:]}, "serial", true, "", nil}
+		return parsed{`serial_number = ?`, []any{q[7:]}, "serial", true, false, "", nil}
 	case strings.HasPrefix(low, "cn:"):
-		return parsed{`cn = ?`, []any{q[3:]}, "subject CN", true, "", nil}
+		return parsed{`cn = ?`, []any{q[3:]}, "subject CN", true, false, "", nil}
 	case strings.HasPrefix(low, "idx:"):
 		n, _ := strconv.ParseUint(q[4:], 10, 64)
 		return idxPred(n)
+	case strings.HasPrefix(low, "names:"):
+		return namesQuery(strings.TrimSpace(q[6:]))
 	}
 
 	if n, err := strconv.ParseUint(q, 10, 64); err == nil {
 		return idxPred(n)
 	}
 	if isHex64(q) {
-		return parsed{`fingerprint = ?`, []any{low}, "fingerprint", true, "", nil}
+		return parsed{`fingerprint = ?`, []any{low}, "fingerprint", true, false, "", nil}
 	}
 
 	if strings.HasPrefix(q, "%.") || strings.HasPrefix(q, "*.") {
@@ -129,7 +134,7 @@ func parseQuery(q string) parsed {
 			// Phase-1 scans certs_idx's narrow domain column instead.
 			sfx := "." + strings.ToLower(suffix)
 			return parsed{
-				`tld = ?`, []any{strings.ToLower(suffix)}, "TLD suffix", false,
+				`tld = ?`, []any{strings.ToLower(suffix)}, "TLD suffix", false, false,
 				`endsWith(domain, ?)`, []any{sfx},
 			}
 		}
@@ -143,13 +148,13 @@ func parseQuery(q string) parsed {
 			pat := strings.ReplaceAll(strings.ToLower(rest), "*", "%")
 			pat = strings.ReplaceAll(pat, `\`, `\\`)
 			pat = strings.ReplaceAll(pat, `_`, `\_`)
-			return parsed{`domain LIKE ?`, []any{"%" + pat}, "name substring", false,
+			return parsed{`domain LIKE ?`, []any{"%" + pat}, "name substring", false, false,
 				`domain LIKE ?`, []any{"%" + pat}}
 		}
 		// plain leading wildcard: domain suffix - no PK prefix to seek on,
 		// but certs_idx's ngram index skips granules that lack the trigrams
 		return parsed{`domain LIKE ?`, []any{"%" + likeEsc(strings.ToLower(rest))},
-			"name suffix", false, `endsWith(domain, ?)`, []any{strings.ToLower(rest)}}
+			"name suffix", false, false, `endsWith(domain, ?)`, []any{strings.ToLower(rest)}}
 	}
 	if strings.ContainsAny(q, "%*") {
 		// wildcard anywhere else: * and % are wildcards, _ and \ escape.
@@ -158,7 +163,7 @@ func parseQuery(q string) parsed {
 		pat := strings.ReplaceAll(low, "*", "%")
 		pat = strings.ReplaceAll(pat, `\`, `\\`)
 		pat = strings.ReplaceAll(pat, `_`, `\_`)
-		return parsed{`domain LIKE ?`, []any{pat}, "name pattern", true, "", nil}
+		return parsed{`domain LIKE ?`, []any{pat}, "name pattern", true, false, "", nil}
 	}
 	// plain name: root_domain = ? covers apex + all subdomains (apex rows
 	// have root_domain = themselves) - single bloom-indexed predicate.
@@ -166,7 +171,7 @@ func parseQuery(q string) parsed {
 	// two-phase: a bare domain can match millions of certs (example.com
 	// style), so sorting whole rows in one pass blows up - phase-1 sorts
 	// only cert_index UInt64s, phase-2 refetches the few display rows
-	return parsed{`root_domain = ?`, []any{low}, "domain + subdomains", false, "", nil}
+	return parsed{`root_domain = ?`, []any{low}, "domain + subdomains", false, false, "", nil}
 }
 
 // idxPred builds the cert_index predicate. With the certs_idx lookup
@@ -178,9 +183,9 @@ func idxPred(n uint64) parsed {
 		w := fmt.Sprintf(
 			`domain IN (SELECT domain FROM %s WHERE cert_index = %d) AND cert_index = %d`,
 			idxTbl, n, n)
-		return parsed{w, nil, "cert index", true, "", nil}
+		return parsed{w, nil, "cert index", true, false, "", nil}
 	}
-	return parsed{`cert_index = ?`, []any{n}, "cert index", true, "", nil}
+	return parsed{`cert_index = ?`, []any{n}, "cert index", true, false, "", nil}
 }
 
 // suffixQuery handles %.example.com - the root_domain bloom index skips
@@ -205,7 +210,42 @@ func suffixQuery(suffix string) parsed {
 	// no p1where: rare suffixes early-terminate badly on certs_idx since it
 	// is ordered by cert_index - a sparse match forces a full-table scan.
 	// root_domain's bloom index on the wide table prunes far better here.
-	return parsed{where, args, "subdomain names", false, "", nil}
+	return parsed{where, args, "subdomain names", false, false, "", nil}
+}
+
+// namesQuery handles names:x - a domain-only predicate evaluated
+// against certs_idx (cert_index, domain). Column set there is narrow,
+// so all filters must reference domain alone.
+func namesQuery(sub string) parsed {
+	s := strings.ToLower(strings.TrimSpace(sub))
+	mk := func(w string, args ...any) parsed {
+		return parsed{w, args, "distinct names", false, true, "", nil}
+	}
+	switch {
+	case s == "":
+		return mk(`domain != ''`)
+	case strings.HasPrefix(s, "%.") || strings.HasPrefix(s, "*."):
+		sfx := s[2:]
+		return mk(`domain = ? OR endsWith(domain, ?)`, sfx, "."+sfx)
+	case strings.HasPrefix(s, "%") || strings.HasPrefix(s, "*"):
+		rest := s[1:]
+		if strings.ContainsAny(rest, "%*") {
+			pat := strings.ReplaceAll(rest, "*", "%")
+			pat = strings.ReplaceAll(pat, `\`, `\\`)
+			pat = strings.ReplaceAll(pat, `_`, `\_`)
+			return mk(`domain LIKE ?`, "%"+pat)
+		}
+		return mk(`endsWith(domain, ?)`, rest)
+	case strings.ContainsAny(s, "%*"):
+		pat := strings.ReplaceAll(s, "*", "%")
+		pat = strings.ReplaceAll(pat, `\`, `\\`)
+		pat = strings.ReplaceAll(pat, `_`, `\_`)
+		return mk(`domain LIKE ?`, pat)
+	default:
+		// bare name: apex + everything under it, matching root_domain
+		// semantics of the plain-name path
+		return mk(`domain = ? OR endsWith(domain, ?)`, s, "."+s)
+	}
 }
 
 // revStr reverses a domain string: "x.example.com" -> "moc.elpmaxe.x"
@@ -289,10 +329,37 @@ vertical-align:-2px;margin-right:.4em}
 <input type="submit" value="Search">
 </form>
 <p class="hint">
-%.example.com = subdomains &nbsp;&middot;&nbsp; example.com = exact name &nbsp;&middot;&nbsp;
-% and * wildcards anywhere (foo%) &nbsp;&middot;&nbsp;
+%.example.com = subdomains &nbsp;&middot;&nbsp; example.com = name + subdomains &nbsp;&middot;&nbsp;
+% and * wildcards anywhere (foo%, %brand%) &nbsp;&middot;&nbsp;
+names:&lt;filter&gt; = distinct names &nbsp;&middot;&nbsp;
 fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt;
-</p>`))
+</p>
+<script>
+// cursor stack for prev-page navigation - cursors are forward-only, so
+// each page's entry cursor is stashed under its page number, keyed by
+// path + query.
+(function(){
+var u=new URL(location),q=u.searchParams.get('q');if(!q)return;
+var p=parseInt(u.searchParams.get('page'))||1;
+var k='ctcur:'+location.pathname+'|'+q,st=[];
+try{st=JSON.parse(sessionStorage.getItem(k)||'[]')}catch(e){}
+st[p]={a:u.searchParams.get('after')||'0',d:u.searchParams.get('afterd')||''};
+st.length=p+1;
+try{sessionStorage.setItem(k,JSON.stringify(st))}catch(e){}
+})();
+function goPrev(){
+var u=new URL(location),q=u.searchParams.get('q'),p=parseInt(u.searchParams.get('page'))||1;
+if(p<=1)return false;
+var v='search?q='+encodeURIComponent(q)+'&page='+(p-1);
+if(p>2){
+var c=null;
+try{c=JSON.parse(sessionStorage.getItem('ctcur:'+location.pathname+'|'+q)||'[]')[p-1]}catch(e){}
+if(c&&(+c.a>0||c.d)){v+='&after='+c.a;if(c.d)v+='&afterd='+encodeURIComponent(c.d)}
+else{history.back();return false}
+}
+location.href=v;
+return false}
+</script>`))
 
 var rowTpl = template.Must(template.New("row").Funcs(
 	template.FuncMap{"ts": tsFormat}).Parse(`<tr>
@@ -307,9 +374,25 @@ var rowTpl = template.Must(template.New("row").Funcs(
 </tr>
 `))
 
+// nameRow is one row of a names: result - a distinct domain with the
+// newest cert_index carrying it (linked to the cert page) and how many
+// SAN rows that name appears in.
+type nameRow struct {
+	Domain string
+	Index  uint64
+	Count  uint64
+}
+
+var nameRowTpl = template.Must(template.New("nrow").Parse(`<tr>
+<td>{{.Domain}}</td>
+<td class="idx"><a href="cert/{{.Index}}">{{.Index}}</a></td>
+<td>{{.Count}}</td>
+</tr>`))
+
 var footTpl = template.Must(template.New("foot").Funcs(
-	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`<p>{{.Kind}}: {{.Count}} row(s){{if .HaveNext}}+ (page limit){{end}} in {{.Elapsed}}
-{{if .HaveNext}}&nbsp; <a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}{{if .NextDom}}&amp;afterd={{urlquery .NextDom}}{{end}}">next page &rarr;</a>{{end}}</p>`))
+	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`<p>{{.Kind}}: {{.Count}} row(s){{if .HaveNext}}+ (page limit){{end}} in {{.Elapsed}} &middot; page {{.Page}}
+{{if .PrevOK}}&nbsp; <a href="#" onclick="return goPrev()">&larr; prev</a>{{end}}
+{{if .HaveNext}}&nbsp; <a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}{{if .NextDom}}&amp;afterd={{urlquery .NextDom}}{{end}}&amp;page={{.NextPage}}">next page &rarr;</a>{{end}}</p>`))
 
 var certTpl = template.Must(template.New("cert").Funcs(
 	template.FuncMap{"ts": tsFormat}).Parse(`<!DOCTYPE html>
@@ -423,7 +506,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 // row; emitStatus (may be nil) reports phase progress for streamed UIs.
 // Returns the error text, row count, and pagination cursor.
 func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
-	emitRow func(row), emitStatus func(string)) (qErr string, count int, haveNext bool, lastIdx uint64, lastDom string) {
+	emitRow func(row), emitName func(nameRow), emitStatus func(string)) (qErr string, count int, haveNext bool, lastIdx uint64, lastDom string) {
 
 	var lastSt time.Time
 	status := func(s string) {
@@ -433,6 +516,54 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 			emitStatus(s)
 			lastSt = time.Now()
 		}
+	}
+
+	if pq.names {
+		// distinct-name aggregation over certs_idx. Pages are ordered
+		// alphabetically by domain; afterd carries the domain cursor.
+		idxTbl := flagIdxOr()
+		if idxTbl == "" {
+			qErr = "names: search requires the certs_idx lookup table"
+			return
+		}
+		nwhere := "(" + pq.where + ")"
+		nargs := append([]any{}, pq.args...)
+		if afterd != "" {
+			nwhere += " AND domain > ?"
+			nargs = append(nargs, afterd)
+		}
+		nargs = append(nargs, *flagLimit+1)
+		status("aggregating distinct names on certs_idx")
+		nr, err := chConn.Query(qctx,
+			`SELECT domain, max(cert_index) AS mi, count() AS c
+			 FROM `+idxTbl+`
+			 WHERE `+nwhere+`
+			 GROUP BY domain
+			 ORDER BY domain ASC
+			 LIMIT ?`, nargs...)
+		if err != nil {
+			qErr = err.Error()
+			return
+		}
+		defer nr.Close()
+		for nr.Next() {
+			var v nameRow
+			if err := nr.Scan(&v.Domain, &v.Index, &v.Count); err != nil {
+				qErr = "scan: " + err.Error()
+				return
+			}
+			if count == *flagLimit {
+				haveNext = true
+				continue
+			}
+			lastDom = v.Domain
+			emitName(v)
+			count++
+		}
+		if err := nr.Err(); err != nil {
+			qErr = err.Error()
+		}
+		return
 	}
 
 	where := "(" + pq.where + ")"
@@ -595,10 +726,14 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 }
 
 // searchArgs pulls the query params shared by all response modes.
-func searchArgs(r *http.Request) (q string, after uint64, afterd string, pq parsed) {
+func searchArgs(r *http.Request) (q string, after uint64, afterd string, page int, pq parsed) {
 	q = r.URL.Query().Get("q")
 	after, _ = strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
 	afterd = r.URL.Query().Get("afterd")
+	page, _ = strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
 	pq = parseQuery(q)
 	return
 }
@@ -611,6 +746,9 @@ type footData struct {
 	NextDom   string
 	Elapsed   string
 	Query     string
+	Page      int
+	PrevOK    bool
+	NextPage  int
 }
 
 // searchShell serves the instant-loading page for browsers: markup and
@@ -619,7 +757,7 @@ type footData struct {
 // this survives response-buffering proxies such as Cloudflare, which
 // would otherwise hold the whole page until the query finishes.
 func searchShell(w http.ResponseWriter, r *http.Request) {
-	q, _, _, pq := searchArgs(r)
+	q, _, _, _, pq := searchArgs(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	headTpl.Execute(w, struct{ Query, Base string }{q, base})
 	if q == "" {
@@ -627,11 +765,15 @@ func searchShell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Fprintf(w, "<p>%s:</p>\n", template.HTMLEscapeString(pq.kind))
+	header := `<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>` +
+		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>"
+	if pq.names {
+		header = `<tr><th>name</th><th>latest cert_index</th><th>rows</th></tr>`
+	}
 	io.WriteString(w, `<div id="ld"><span class="spin"></span>`+
 		`querying clickhouse&hellip; <span id="elt">0.0</span>s`+
 		` &mdash; <span id="st">starting</span></div>`+"\n"+
-		`<div class="tw" id="tw"><table>`+"\n<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
-		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n<tbody id=\"rt\"></tbody></table></div>\n"+
+		`<div class="tw" id="tw"><table>`+"\n"+header+"\n<tbody id=\"rt\"></tbody></table></div>\n"+
 		`<script>var _t0=Date.now(),_tm=setInterval(function(){`+
 		`var e=document.getElementById('elt');`+
 		`if(!e){clearInterval(_tm);return}`+
@@ -657,7 +799,7 @@ func searchShell(w http.ResponseWriter, r *http.Request) {
 // plus a final `end` (footer html) or `err` event. Heartbeat comments
 // keep the connection alive through proxies during long scans.
 func searchSSE(w http.ResponseWriter, r *http.Request) {
-	q, after, afterd, pq := searchArgs(r)
+	q, after, afterd, page, pq := searchArgs(r)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -685,6 +827,7 @@ func searchSSE(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd,
 		func(rw row) { sse.send("row", tplStr(rowTpl, rw)) },
+		func(nr nameRow) { sse.send("row", tplStr(nameRowTpl, nr)) },
 		func(s string) { sse.send("status", s) })
 	if qErr != "" {
 		sse.send("err", qErr)
@@ -692,13 +835,13 @@ func searchSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	sse.send("end", tplStr(footTpl, footData{
 		pq.kind, count, haveNext, lastIdx, lastDom,
-		time.Since(start).String(), q}))
+		time.Since(start).String(), q, page, page > 1, page + 1}))
 }
 
 // searchInline streams the plain-HTML page as before - for curl and
 // other non-browser clients that cannot consume SSE.
 func searchInline(w http.ResponseWriter, r *http.Request) {
-	q, after, afterd, pq := searchArgs(r)
+	q, after, afterd, page, pq := searchArgs(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Accel-Buffering", "no") // let rows trickle through nginx
 	headTpl.Execute(w, struct{ Query, Base string }{q, base})
@@ -708,8 +851,12 @@ func searchInline(w http.ResponseWriter, r *http.Request) {
 	}
 	fl, _ := w.(http.Flusher)
 	fmt.Fprintf(w, "<p>%s:</p>\n", template.HTMLEscapeString(pq.kind))
-	io.WriteString(w, `<div class="tw"><table>`+"\n<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
-		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n")
+	header := `<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>` +
+		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>"
+	if pq.names {
+		header = `<tr><th>name</th><th>latest cert_index</th><th>rows</th></tr>`
+	}
+	io.WriteString(w, `<div class="tw"><table>`+"\n"+header+"\n")
 	if fl != nil {
 		fl.Flush() // show the table skeleton while the query scans
 	}
@@ -725,6 +872,12 @@ func searchInline(w http.ResponseWriter, r *http.Request) {
 			if n++; fl != nil && n%16 == 0 {
 				fl.Flush()
 			}
+		},
+		func(nr nameRow) {
+			nameRowTpl.Execute(w, nr)
+			if n++; fl != nil && n%16 == 0 {
+				fl.Flush()
+			}
 		}, nil)
 
 	if qErr != "" {
@@ -733,7 +886,7 @@ func searchInline(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "</table></div>")
 		footTpl.Execute(w, footData{
 			pq.kind, count, haveNext, lastIdx, lastDom,
-			time.Since(start).String(), q})
+			time.Since(start).String(), q, page, page > 1, page + 1})
 	}
 	io.WriteString(w, "</body></html>")
 }
