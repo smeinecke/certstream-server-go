@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -151,7 +152,10 @@ func parseQuery(q string) parsed {
 	// plain name: root_domain = ? covers apex + all subdomains (apex rows
 	// have root_domain = themselves) - single bloom-indexed predicate.
 	// An OR with domain = ? here would defeat granule pruning entirely.
-	return parsed{`root_domain = ?`, []any{low}, "domain + subdomains", true, "", nil}
+	// two-phase: a bare domain can match millions of certs (example.com
+	// style), so sorting whole rows in one pass blows up - phase-1 sorts
+	// only cert_index UInt64s, phase-2 refetches the few display rows
+	return parsed{`root_domain = ?`, []any{low}, "domain + subdomains", false, "", nil}
 }
 
 // idxPred builds the cert_index predicate. With the certs_idx lookup
@@ -285,8 +289,7 @@ var rowTpl = template.Must(template.New("row").Funcs(
 `))
 
 var footTpl = template.Must(template.New("foot").Funcs(
-	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`</table></div>
-<p>{{.Kind}}: {{.Count}} row(s){{if .HaveNext}}+ (page limit){{end}} in {{.Elapsed}}
+	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`<p>{{.Kind}}: {{.Count}} row(s){{if .HaveNext}}+ (page limit){{end}} in {{.Elapsed}}
 {{if .HaveNext}}&nbsp; <a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}{{if .NextDom}}&amp;afterd={{urlquery .NextDom}}{{end}}">next page &rarr;</a>{{end}}</p>`))
 
 var certTpl = template.Must(template.New("cert").Funcs(
@@ -341,32 +344,66 @@ func tsFormat(v uint64) string {
 	return time.Unix(int64(v), 0).UTC().Format("2006-01-02 15:04:05")
 }
 
+// sseWriter frames output as server-sent events. Cloudflare and other
+// buffering proxies pass text/event-stream through live, unlike HTML
+// bodies which they hold until the response completes.
+type sseWriter struct {
+	w  io.Writer
+	fl http.Flusher
+	mu sync.Mutex
+}
+
+// send emits one event; multi-line data is split into separate data:
+// lines per the SSE spec.
+func (s *sseWriter) send(event, data string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if event != "" {
+		fmt.Fprintf(s.w, "event: %s\n", event)
+	}
+	for _, l := range strings.Split(data, "\n") {
+		fmt.Fprintf(s.w, "data: %s\n", l)
+	}
+	io.WriteString(s.w, "\n")
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+}
+
+// beat emits a comment heartbeat so idle phases (long scans producing
+// no rows) do not trip proxy idle timeouts (~100s on Cloudflare).
+func (s *sseWriter) beat() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	io.WriteString(s.w, ": hb\n\n")
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+}
+
+// tplStr renders a template into a string for SSE payloads.
+func tplStr(t *template.Template, data any) string {
+	var sb strings.Builder
+	t.Execute(&sb, data)
+	return sb.String()
+}
+
 func searchHandler(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query().Get("q")
-	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
-	afterd := r.URL.Query().Get("afterd")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("X-Accel-Buffering", "no") // let rows trickle through nginx
-	headTpl.Execute(w, struct{ Query, Base string }{q, base})
-	if q == "" {
-		io.WriteString(w, "</body></html>")
-		return
+	acc := r.Header.Get("Accept")
+	switch {
+	case strings.Contains(acc, "text/event-stream"):
+		searchSSE(w, r)
+	case strings.Contains(acc, "text/html"):
+		searchShell(w, r)
+	default:
+		searchInline(w, r) // curl/API clients: inline rows as before
 	}
-	fl, _ := w.(http.Flusher)
-	pq := parseQuery(q)
-	fmt.Fprintf(w, "<p>%s:</p>\n", template.HTMLEscapeString(pq.kind))
-	io.WriteString(w, `<div id="ld"><span class="spin"></span>`+
-		`querying clickhouse&hellip; <span id="elt">0.0</span>s`+
-		` &mdash; rows stream in below</div>`+"\n"+
-		`<script>var _t0=Date.now(),_tm=setInterval(function(){`+
-		`var e=document.getElementById('elt');`+
-		`if(!e){clearInterval(_tm);return}`+
-		`e.textContent=((Date.now()-_t0)/1000).toFixed(1)},100);</script>`+"\n"+
-		`<div class="tw"><table>`+"\n<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
-		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n")
-	if fl != nil {
-		fl.Flush() // show the table skeleton while the query scans
-	}
+}
+
+// runSearch executes the parsed query and calls emitRow per display
+// row. Returns the error text, row count, and pagination cursor.
+func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
+	emitRow func(row)) (qErr string, count int, haveNext bool, lastIdx uint64, lastDom string) {
 
 	where := "(" + pq.where + ")"
 	args := append([]any{}, pq.args...)
@@ -382,18 +419,6 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	args = append(args, *flagLimit+1)
-
-	// bound the total query time below the proxy read timeout so a timeout
-	// error can still be rendered on the page (and the spinner removed)
-	qctx, qcancel := context.WithTimeout(r.Context(), *flagQTimeout)
-	defer qcancel()
-
-	start := time.Now()
-	var qErr string
-	var count int
-	var lastIdx uint64
-	var lastDom string
-	haveNext := false
 
 	const cols = `cert_index, timestamp, not_before, not_after, cn, domain, serial_number, o, hostnames`
 	emit := func(rows driver.Rows, capRows bool) {
@@ -411,11 +436,8 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			lastIdx, lastDom = rw.Index, rw.Domain
 			rw.Hostnames = shortNames(rw.Hostnames, 200)
-			rowTpl.Execute(w, rw)
+			emitRow(rw)
 			count++
-			if fl != nil && count%16 == 0 {
-				fl.Flush()
-			}
 		}
 		if qErr == "" {
 			if err := rows.Err(); err != nil {
@@ -518,24 +540,150 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if qErr != "" {
-		if qctx.Err() == context.DeadlineExceeded {
-			qErr = fmt.Sprintf("query exceeded the %s server-side budget - too broad or too much load; try a narrower name", flagQTimeout)
+	if qErr != "" && qctx.Err() == context.DeadlineExceeded {
+		qErr = fmt.Sprintf("query exceeded the %s server-side budget - too broad or too much load; try a narrower name", flagQTimeout)
+	}
+	return
+}
+
+// searchArgs pulls the query params shared by all response modes.
+func searchArgs(r *http.Request) (q string, after uint64, afterd string, pq parsed) {
+	q = r.URL.Query().Get("q")
+	after, _ = strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
+	afterd = r.URL.Query().Get("afterd")
+	pq = parseQuery(q)
+	return
+}
+
+type footData struct {
+	Kind      string
+	Count     int
+	HaveNext  bool
+	NextAfter uint64
+	NextDom   string
+	Elapsed   string
+	Query     string
+}
+
+// searchShell serves the instant-loading page for browsers: markup and
+// the loading widget only. A small script then opens an EventSource on
+// the same URL (Accept: text/event-stream) and rows stream in live -
+// this survives response-buffering proxies such as Cloudflare, which
+// would otherwise hold the whole page until the query finishes.
+func searchShell(w http.ResponseWriter, r *http.Request) {
+	q, _, _, pq := searchArgs(r)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	headTpl.Execute(w, struct{ Query, Base string }{q, base})
+	if q == "" {
+		io.WriteString(w, "</body></html>")
+		return
+	}
+	fmt.Fprintf(w, "<p>%s:</p>\n", template.HTMLEscapeString(pq.kind))
+	io.WriteString(w, `<div id="ld"><span class="spin"></span>`+
+		`querying clickhouse&hellip; <span id="elt">0.0</span>s`+
+		` &mdash; rows stream in below</div>`+"\n"+
+		`<div class="tw" id="tw"><table>`+"\n<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
+		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n<tbody id=\"rt\"></tbody></table></div>\n"+
+		`<script>var _t0=Date.now(),_tm=setInterval(function(){`+
+		`var e=document.getElementById('elt');`+
+		`if(!e){clearInterval(_tm);return}`+
+		`e.textContent=((Date.now()-_t0)/1000).toFixed(1)},100);`+
+		`var es=new EventSource(location.href),tb=document.getElementById('rt'),`+
+		`tw=document.getElementById('tw');`+
+		`function fin(){clearInterval(_tm);var l=document.getElementById('ld');`+
+		`if(l)l.remove();es.close();}`+
+		`es.addEventListener('row',function(e){tb.insertAdjacentHTML('beforeend',e.data)});`+
+		`es.addEventListener('end',function(e){`+
+		`tw.insertAdjacentHTML('afterend',e.data);fin()});`+
+		`es.addEventListener('err',function(e){`+
+		`tw.insertAdjacentHTML('afterend','<p class="err">'+`+
+		`e.data.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</p>');fin()});`+
+		`es.onerror=function(){`+
+		`tw.insertAdjacentHTML('afterend','<p class="err">connection lost - the query may have died server-side; retry</p>');`+
+		`fin()};</script>`+"\n</body></html>")
+}
+
+// searchSSE runs the query and streams one `row` event per result row
+// plus a final `end` (footer html) or `err` event. Heartbeat comments
+// keep the connection alive through proxies during long scans.
+func searchSSE(w http.ResponseWriter, r *http.Request) {
+	q, after, afterd, pq := searchArgs(r)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	fl, _ := w.(http.Flusher)
+	sse := &sseWriter{w: w, fl: fl}
+
+	qctx, qcancel := context.WithTimeout(r.Context(), *flagQTimeout)
+	defer qcancel()
+
+	hb := time.NewTicker(15 * time.Second)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-hb.C:
+				sse.beat()
+			}
 		}
+	}()
+	defer hb.Stop()
+
+	start := time.Now()
+	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd,
+		func(rw row) { sse.send("row", tplStr(rowTpl, rw)) })
+	if qErr != "" {
+		sse.send("err", qErr)
+		return
+	}
+	sse.send("end", tplStr(footTpl, footData{
+		pq.kind, count, haveNext, lastIdx, lastDom,
+		time.Since(start).String(), q}))
+}
+
+// searchInline streams the plain-HTML page as before - for curl and
+// other non-browser clients that cannot consume SSE.
+func searchInline(w http.ResponseWriter, r *http.Request) {
+	q, after, afterd, pq := searchArgs(r)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Accel-Buffering", "no") // let rows trickle through nginx
+	headTpl.Execute(w, struct{ Query, Base string }{q, base})
+	if q == "" {
+		io.WriteString(w, "</body></html>")
+		return
+	}
+	fl, _ := w.(http.Flusher)
+	fmt.Fprintf(w, "<p>%s:</p>\n", template.HTMLEscapeString(pq.kind))
+	io.WriteString(w, `<div class="tw"><table>`+"\n<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
+		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n")
+	if fl != nil {
+		fl.Flush() // show the table skeleton while the query scans
+	}
+
+	qctx, qcancel := context.WithTimeout(r.Context(), *flagQTimeout)
+	defer qcancel()
+
+	start := time.Now()
+	var n int
+	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd,
+		func(rw row) {
+			rowTpl.Execute(w, rw)
+			if n++; fl != nil && n%16 == 0 {
+				fl.Flush()
+			}
+		})
+
+	if qErr != "" {
 		fmt.Fprintf(w, `</table></div><p class="err">%s</p>`, template.HTMLEscapeString(qErr))
 	} else {
-		footTpl.Execute(w, struct {
-			Kind      string
-			Count     int
-			HaveNext  bool
-			NextAfter uint64
-			NextDom   string
-			Elapsed   string
-			Query     string
-		}{pq.kind, count, haveNext, lastIdx, lastDom, time.Since(start).String(), q})
+		io.WriteString(w, "</table></div>")
+		footTpl.Execute(w, footData{
+			pq.kind, count, haveNext, lastIdx, lastDom,
+			time.Since(start).String(), q})
 	}
-	io.WriteString(w, `<script>clearInterval(_tm);`+
-		`var _l=document.getElementById('ld');if(_l)_l.remove();</script>`)
 	io.WriteString(w, "</body></html>")
 }
 
