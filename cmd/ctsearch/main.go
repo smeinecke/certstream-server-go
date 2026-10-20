@@ -203,12 +203,13 @@ func isHex64(s string) bool {
 // --- http ------------------------------------------------------------------
 
 var headTpl = template.Must(template.New("head").Parse(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>ct search</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ct search</title>
 <style>
-body{font-family:monospace;font-size:13px;margin:2em auto;max-width:1400px}
-input[type=text]{width:50%;font-family:monospace;font-size:14px;padding:4px}
+body{font-family:monospace;font-size:13px;margin:2em auto;padding:0 12px;max-width:1400px;box-sizing:border-box}
+input[type=text]{width:50%;min-width:12em;font-family:monospace;font-size:14px;padding:4px;box-sizing:border-box}
+.tw{overflow-x:auto}
 table{border-collapse:collapse;width:100%;margin-top:1em}
-th,td{border:1px solid #999;padding:3px 6px;text-align:left;vertical-align:top}
+th,td{border:1px solid #999;padding:3px 6px;text-align:left;vertical-align:top;overflow-wrap:anywhere}
 th{background:#ddd}
 tr:nth-child(even){background:#f4f4f4}
 a{color:#005}
@@ -247,23 +248,24 @@ var rowTpl = template.Must(template.New("row").Funcs(
 `))
 
 var footTpl = template.Must(template.New("foot").Funcs(
-	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`</table>
+	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`</table></div>
 <p>{{.Kind}}: {{.Count}} row(s){{if .HaveNext}}+ (page limit){{end}} in {{.Elapsed}}
 {{if .HaveNext}}&nbsp; <a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}{{if .NextDom}}&amp;afterd={{urlquery .NextDom}}{{end}}">next page &rarr;</a>{{end}}</p>`))
 
 var certTpl = template.Must(template.New("cert").Funcs(
 	template.FuncMap{"ts": tsFormat}).Parse(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>cert {{.Index}}</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>cert {{.Index}}</title>
 <style>
-body{font-family:monospace;font-size:13px;margin:2em auto;max-width:1200px}
+body{font-family:monospace;font-size:13px;margin:2em auto;padding:0 12px;max-width:1200px;box-sizing:border-box}
+.tw{overflow-x:auto}
 table{border-collapse:collapse;width:100%}
-th,td{border:1px solid #999;padding:3px 6px;text-align:left;vertical-align:top}
+th,td{border:1px solid #999;padding:3px 6px;text-align:left;vertical-align:top;overflow-wrap:anywhere}
 th{background:#ddd;width:220px}
 pre{white-space:pre-wrap;word-break:break-all;margin:0}
 </style><base href="{{.Base}}"></head><body>
 <p><a href="">&larr; search</a></p>
 {{if .Err}}<p>{{.Err}}</p>{{else}}
-<table>
+<div class="tw"><table>
 <tr><th>cert_index</th><td>{{.Index}}</td></tr>
 <tr><th>seen (inserted)</th><td>{{.Seen}}</td></tr>
 <tr><th>not_before</th><td>{{ts .NotBefore}}</td></tr>
@@ -286,7 +288,7 @@ pre{white-space:pre-wrap;word-break:break-all;margin:0}
 <tr><th>scts</th><td><pre>{{.SCT}}</pre></td></tr>
 <tr><th>tld / root_domain</th><td>{{.TLD}} / {{.RootDomain}}</td></tr>
 <tr><th>cert_link</th><td><a href="{{.CertLink}}">{{.CertLink}}</a></td></tr>
-</table>
+</table></div>
 <p class="hint">issuer CN/O not stored - only AKI. DER fetch: <a href="{{.CertLink}}">cert_link</a></p>
 {{end}}
 </body></html>`))
@@ -323,7 +325,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		`var e=document.getElementById('elt');`+
 		`if(!e){clearInterval(_tm);return}`+
 		`e.textContent=((Date.now()-_t0)/1000).toFixed(1)},100);</script>`+"\n"+
-		"<table>\n<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
+		`<div class="tw"><table>`+"\n<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>"+
 		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>\n")
 	if fl != nil {
 		fl.Flush() // show the table skeleton while the query scans
@@ -428,8 +430,10 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			lastIdx = indexes[len(indexes)-1]
 		}
 
-		// Phase 2: fetch the display columns for just those indices via the
-		// cert_index bloom index - bounded, near-point lookups
+		// Phase 2: fetch the display columns for just those indices. Route
+		// through certs_idx when configured: the (cert_index, domain) lookup
+		// turns this into domain-PK seeks instead of a wide-table bloom
+		// rescan on cert_index.
 		if qErr == "" && len(indexes) > 0 {
 			// inline the uint64 list - parameter binds are not 'constant' for IN
 			var sb strings.Builder
@@ -439,9 +443,14 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				sb.WriteString(strconv.FormatUint(v, 10))
 			}
+			pred := `cert_index IN (` + sb.String() + `)`
+			if idxTbl := flagIdxOr(); idxTbl != "" {
+				pred = `domain IN (SELECT domain FROM ` + idxTbl +
+					` WHERE cert_index IN (` + sb.String() + `)) AND ` + pred
+			}
 			rows, err := chConn.Query(r.Context(),
 				`SELECT `+cols+` FROM `+flagDBOr()+`.`+flagTableOr()+`
-				 WHERE cert_index IN (`+sb.String()+`)
+				 WHERE `+pred+`
 				 ORDER BY cert_index, domain`)
 			if err != nil {
 				qErr = err.Error()
@@ -453,7 +462,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if qErr != "" {
-		fmt.Fprintf(w, `</table><p class="err">%s</p>`, template.HTMLEscapeString(qErr))
+		fmt.Fprintf(w, `</table></div><p class="err">%s</p>`, template.HTMLEscapeString(qErr))
 	} else {
 		footTpl.Execute(w, struct {
 			Kind      string
