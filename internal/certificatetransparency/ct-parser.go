@@ -5,7 +5,6 @@ import (
 	"crypto/sha1" //nolint:gosec
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"hash"
 	"log"
@@ -74,16 +73,15 @@ func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL, logType stri
 		return models.Data{}, ErrNoCertFound
 	}
 
+	// Guard against empty precert input producing a constant fingerprint.
+	if isPrecert && len(rawData) == 0 {
+		rawData = cert.Raw
+	}
+
 	// Calculate certificate hash from the raw DER bytes of the certificate
-	data.LeafCert = leafCertFromX509cert(*cert)
+	data.LeafCert = leafCertFromX509cert(*cert, rawData)
 
-	// recalculate hashes if the certificate is a precertificate
 	if isPrecert {
-		calculatedHash := calculateSHA1(rawData)
-		data.LeafCert.Fingerprint = calculatedHash
-		data.LeafCert.SHA1 = calculatedHash
-		data.LeafCert.SHA256 = calculateSHA256(rawData)
-
 		// Since we use the TBSCertificate to parse the LeafCert, the PoisonByte indicator cannot be set by our parser.
 		// According to RFC 6962 Section 3.2 the `"tbs_certificate" is the DER-encoded TBSCertificate (see [RFC5280])
 		// component of the Precertificate -- that is, without the signature and the poison extension.`
@@ -116,7 +114,7 @@ func parseCertificateChain(logEntry *ct.LogEntry) ([]models.LeafCert, error) {
 			return nil, fmt.Errorf("could not parse certificate: %w", parseErr)
 		}
 
-		leafCert := leafCertFromX509cert(*myCert)
+		leafCert := leafCertFromX509cert(*myCert, myCert.Raw)
 		chain[i] = leafCert
 	}
 
@@ -124,7 +122,9 @@ func parseCertificateChain(logEntry *ct.LogEntry) ([]models.LeafCert, error) {
 }
 
 // leafCertFromX509cert converts a x509.Certificate to the custom LeafCert data structure.
-func leafCertFromX509cert(cert x509.Certificate) models.LeafCert {
+// hashData is the raw input for the fingerprint hashes - for regular certs it is
+// cert.Raw, for precerts the submitted precert bytes.
+func leafCertFromX509cert(cert x509.Certificate, hashData []byte) models.LeafCert {
 	leafCert := models.LeafCert{
 		AllDomains:         cert.DNSNames,
 		Extensions:         models.Extensions{},
@@ -152,9 +152,9 @@ func leafCertFromX509cert(cert x509.Certificate) models.LeafCert {
 	leafCert.Issuer = buildSubject(cert.Issuer)
 
 	leafCert.AsDER = base64.StdEncoding.EncodeToString(cert.Raw)
-	leafCert.Fingerprint = calculateSHA1(cert.Raw)
+	leafCert.Fingerprint = calculateSHA1(hashData)
 	leafCert.SHA1 = leafCert.Fingerprint
-	leafCert.SHA256 = calculateSHA256(cert.Raw)
+	leafCert.SHA256 = calculateSHA256(hashData)
 
 	// TODO fix Extensions - check x509util.go
 	for _, extension := range cert.Extensions {
@@ -167,7 +167,10 @@ func leafCertFromX509cert(cert x509.Certificate) models.LeafCert {
 		case extension.Id.Equal(x509.OIDExtensionSubjectKeyId):
 			leafCert.Extensions.SubjectKeyIdentifier = formatKeyID(cert.SubjectKeyId)
 		case extension.Id.Equal(x509.OIDExtensionBasicConstraints):
-			isCA := strings.ToUpper(fmt.Sprintf("CA:%t", cert.IsCA))
+			isCA := "CA:FALSE"
+			if cert.IsCA {
+				isCA = "CA:TRUE"
+			}
 			leafCert.Extensions.BasicConstraints = &isCA
 		case extension.Id.Equal(x509.OIDExtensionSubjectAltName):
 			var buf bytes.Buffer
@@ -259,17 +262,21 @@ func buildSubject(certSubject pkix.Name) models.Subject {
 	return subject
 }
 
+const lowerHex = "0123456789abcdef"
+
 // formatKeyID transforms the AuthorityKeyIdentifier to be more readable.
 func formatKeyID(keyID []byte) *string {
-	tmp := hex.EncodeToString(keyID)
-	var digest string
+	result := make([]byte, 0, len("keyid:")+len(keyID)*3-1)
+	result = append(result, "keyid:"...)
 
-	for i := 0; i < len(tmp); i += 2 {
-		digest = digest + ":" + tmp[i:i+2]
+	for i, b := range keyID {
+		if i > 0 {
+			result = append(result, ':')
+		}
+		result = append(result, lowerHex[b>>4], lowerHex[b&0x0f])
 	}
 
-	digest = strings.TrimLeft(digest, ":")
-	digest = "keyid:" + digest
+	digest := string(result)
 
 	return &digest
 }
@@ -288,17 +295,12 @@ func parseName(input []string) *string {
 		return nil
 	}
 
-	var result string
-	for _, s := range input {
-		if len(result) > 0 {
-			result += ","
-		}
-
-		result += s
-	}
+	result := strings.Join(input, ",")
 
 	return &result
 }
+
+const upperHex = "0123456789ABCDEF"
 
 // calculateHash takes a hash.Hash implementation and calculates the hash of the given data.
 // It returns the hash in the format "XX:XX:XX:...".
@@ -309,22 +311,17 @@ func calculateHash(data []byte, certHasher hash.Hash) string {
 		return ""
 	}
 
-	certHash := fmt.Sprintf("%02x", certHasher.Sum(nil))
-	certHash = strings.ToUpper(certHash)
+	sum := certHasher.Sum(nil)
 
-	var result bytes.Buffer
-
-	//nolint:intrange
-	for i := 0; i < len(certHash); i++ {
-		if i%2 == 0 && i > 0 {
-			result.WriteByte(':')
+	result := make([]byte, 0, len(sum)*3-1)
+	for i, b := range sum {
+		if i > 0 {
+			result = append(result, ':')
 		}
-
-		c := certHash[i]
-		result.WriteByte(c)
+		result = append(result, upperHex[b>>4], upperHex[b&0x0f])
 	}
 
-	return result.String()
+	return string(result)
 }
 
 // calculateSHA1 calculates the SHA1 fingerprint of the given data.
