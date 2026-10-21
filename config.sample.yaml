@@ -101,6 +101,13 @@ general:
   # This option defaults to true. See https://github.com/d-Rickyy-b/certstream-server-go/issues/51
   drop_old_logs: true
 
+  # If enabled, only the leaf certificate is parsed per entry - chain parsing
+  # and base64 DER materialization are skipped. This cuts per-cert CPU roughly
+  # in half, but the full stream will carry an empty chain and no as_der field.
+  # Enable only if no consumer needs chain/DER data (e.g. lite-stream consumers
+  # like certhoover, which never receive those fields anyway).
+  slim_broadcast: false
+
   # Options for resuming certificate downloads after restart
   recovery:
     # If enabled, the server will resume downloading certificates from the last processed and stored index for each log.
