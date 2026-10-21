@@ -171,13 +171,16 @@ func TestLoadCTIndex_LoadsEmptyFile(t *testing.T) {
 		t.Fatalf("failed to write test file: %v", err)
 	}
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("expected panic, got none")
-		}
-	}()
-
+	// An empty file is treated as corrupt - quarantined, empty index, no panic.
 	m.LoadCTIndex(path)
+
+	if len(m.index) != 0 {
+		t.Fatalf("expected empty index after corrupt file, got %d entries", len(m.index))
+	}
+
+	if _, err := os.Stat(path + ".corrupt"); os.IsNotExist(err) {
+		t.Fatal("expected empty file to be moved to .corrupt")
+	}
 }
 
 func TestLoadCTIndex_OverwritesPreexistingIndex(t *testing.T) {
@@ -207,7 +210,7 @@ func TestLoadCTIndex_OverwritesPreexistingIndex(t *testing.T) {
 	}
 }
 
-func TestLoadCTIndex_PanicsOnInvalidJSON(t *testing.T) {
+func TestLoadCTIndex_QuarantinesInvalidJSON(t *testing.T) {
 	m := &LogMetrics{metrics: make(CTMetrics), index: make(CTCertIndex)}
 	path := filepath.Join(t.TempDir(), "ct_index.json")
 
@@ -215,13 +218,113 @@ func TestLoadCTIndex_PanicsOnInvalidJSON(t *testing.T) {
 		t.Fatalf("failed to write test file: %v", err)
 	}
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected panic for invalid JSON, but did not panic")
-		}
-	}()
+	// A corrupt index file must not panic the service - it is moved aside and
+	// the index starts empty.
+	m.LoadCTIndex(path)
+
+	if len(m.index) != 0 {
+		t.Fatalf("expected empty index after corrupt file, got %d entries", len(m.index))
+	}
+
+	if _, err := os.Stat(path + ".corrupt"); os.IsNotExist(err) {
+		t.Fatal("expected corrupt file to be moved to .corrupt")
+	}
+}
+
+func TestLoadCTIndex_RecoversFromBackup(t *testing.T) {
+	m := &LogMetrics{metrics: make(CTMetrics), index: make(CTCertIndex)}
+	path := filepath.Join(t.TempDir(), "ct_index.json")
+
+	if err := os.WriteFile(path, []byte("not valid json"), 0o644); err != nil {
+		t.Fatalf("failed to write corrupt file: %v", err)
+	}
+
+	backup := CTCertIndex{"https://ct.example.com/log": 77}
+	data, marshalErr := json.Marshal(backup)
+	if marshalErr != nil {
+		t.Fatalf("failed to marshal backup data: %v", marshalErr)
+	}
+	if err := os.WriteFile(path+".bak", data, 0o644); err != nil {
+		t.Fatalf("failed to write backup file: %v", err)
+	}
 
 	m.LoadCTIndex(path)
+
+	if got := m.GetCTIndex("https://ct.example.com/log"); got != 77 {
+		t.Fatalf("expected index 77 recovered from backup, got %d", got)
+	}
+}
+
+func TestLoadCTIndex_CorruptJSONPartialDataNotMerged(t *testing.T) {
+	m := &LogMetrics{metrics: make(CTMetrics), index: make(CTCertIndex)}
+	path := filepath.Join(t.TempDir(), "ct_index.json")
+
+	// Truncated mid-object: unmarshal may populate some entries before failing.
+	if err := os.WriteFile(path, []byte(`{"https://a.example.com": 5, "https://b`), 0o644); err != nil {
+		t.Fatalf("failed to write corrupt file: %v", err)
+	}
+
+	backup := CTCertIndex{"https://ct.example.com/log": 77}
+	data, marshalErr := json.Marshal(backup)
+	if marshalErr != nil {
+		t.Fatalf("failed to marshal backup data: %v", marshalErr)
+	}
+	if err := os.WriteFile(path+".bak", data, 0o644); err != nil {
+		t.Fatalf("failed to write backup file: %v", err)
+	}
+
+	m.LoadCTIndex(path)
+
+	// The restored index must contain only backup data - no partial entries
+	// from the failed unmarshal may leak through.
+	if got := m.GetCTIndex("https://a.example.com"); got != 0 {
+		t.Fatalf("partial entry leaked into restored index: got %d", got)
+	}
+	if got := m.GetCTIndex("https://ct.example.com/log"); got != 77 {
+		t.Fatalf("expected index 77 recovered from backup, got %d", got)
+	}
+}
+
+func TestSaveCertIndexes_RotatesBackup(t *testing.T) {
+	m := &LogMetrics{metrics: make(CTMetrics), index: make(CTCertIndex)}
+	path := filepath.Join(t.TempDir(), "ct_index.json")
+
+	m.SetCTIndex("https://ct.example.com/log", 42)
+	if err := m.SaveCertIndexes(path); err != nil {
+		t.Fatalf("first save failed: %v", err)
+	}
+
+	m.SetCTIndex("https://ct.example.com/log", 84)
+	if err := m.SaveCertIndexes(path); err != nil {
+		t.Fatalf("second save failed: %v", err)
+	}
+
+	// The .bak file must hold the previous generation.
+	backup, err := os.ReadFile(path + ".bak")
+	if err != nil {
+		t.Fatalf("expected .bak file after second save: %v", err)
+	}
+
+	var restored CTCertIndex
+	if jsonErr := json.Unmarshal(backup, &restored); jsonErr != nil {
+		t.Fatalf("backup file is not valid JSON: %v", jsonErr)
+	}
+	if restored["https://ct.example.com/log"] != 42 {
+		t.Fatalf("expected backup to contain index 42, got %d", restored["https://ct.example.com/log"])
+	}
+
+	// And the main file must hold the newest generation.
+	mainData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read main index file: %v", err)
+	}
+	var current CTCertIndex
+	if jsonErr := json.Unmarshal(mainData, &current); jsonErr != nil {
+		t.Fatalf("main file is not valid JSON: %v", jsonErr)
+	}
+	if current["https://ct.example.com/log"] != 84 {
+		t.Fatalf("expected main file to contain index 84, got %d", current["https://ct.example.com/log"])
+	}
 }
 
 func TestLoadCTIndex_PanicsWhenDirectoryMissing(t *testing.T) {
