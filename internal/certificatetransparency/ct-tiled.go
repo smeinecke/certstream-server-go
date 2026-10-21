@@ -268,13 +268,27 @@ func NewStaticCTClient(url string, httpClient *http.Client, userAgent string, st
 	}
 }
 
+// maxConsecutiveFailures is the number of failed poll attempts tolerated
+// before the error is escalated to the caller (which restarts the worker).
+// Transient errors like rate limits or tiles lagging behind a published
+// checkpoint are absorbed by the backoff loop instead.
+const maxConsecutiveFailures = 5
+
 // Monitor continuously monitors the tiled CT log for new entries, starting from the current ctIndex.
 func (s *StaticCTClient) Monitor(ctx context.Context, foundCert, foundPrecert func(*ct.RawLogEntry)) error {
+	var consecutiveFailures int
+
 	for {
 		hadNewEntries, err := s.fetchAndProcessTiles(ctx, foundCert, foundPrecert)
 		if err != nil {
-			log.Printf("Error processing tiled log updates for '%s': %s\n", s.url, err)
-			return err
+			consecutiveFailures++
+			log.Printf("Error processing tiled log updates for '%s' (%d/%d): %s\n", s.url, consecutiveFailures, maxConsecutiveFailures, err)
+
+			if consecutiveFailures >= maxConsecutiveFailures {
+				return err
+			}
+		} else {
+			consecutiveFailures = 0
 		}
 
 		// Reset backoff if we found new entries
