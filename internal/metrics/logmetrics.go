@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -200,15 +201,34 @@ func (m *LogMetrics) LoadCTIndex(ctIndexFilePath string) {
 
 	m.index = make(CTCertIndex)
 
-	if len(bytes) == 0 || string(bytes) == "" {
-		log.Panicln("CT index file is empty!")
-		return
-	}
+	if jerr := json.Unmarshal(bytes, &m.index); jerr != nil {
+		log.Printf("Error unmarshalling CT index file '%s': %s\n", ctIndexFilePath, jerr)
 
-	jerr := json.Unmarshal(bytes, &m.index)
-	if jerr != nil {
-		log.Printf("Error unmarshalling CT index file: '%s'\n", ctIndexFilePath)
-		log.Panicln(jerr)
+		// Try recovering from the last-good backup written by SaveCertIndexes.
+		// Unmarshal into a fresh map - a failed unmarshal may have left partial
+		// data in m.index which must not be merged into the restored index.
+		backupPath := ctIndexFilePath + ".bak"
+		backup, readErr := os.ReadFile(backupPath)
+		if readErr == nil {
+			restored := make(CTCertIndex)
+			if json.Unmarshal(backup, &restored) == nil {
+				m.index = restored
+				log.Printf("Recovered CT indexes from backup file '%s'\n", backupPath)
+				return
+			}
+		}
+
+		// A corrupt index file must not crash the service - quarantine it
+		// and continue with an empty index (same as first start).
+		corruptPath := ctIndexFilePath + ".corrupt"
+		log.Printf("No usable backup found - moving corrupt index file to '%s'\n", corruptPath)
+
+		if renameErr := os.Rename(ctIndexFilePath, corruptPath); renameErr != nil {
+			log.Printf("Could not move corrupt index file: %s\n", renameErr)
+		}
+
+		m.index = make(CTCertIndex)
+		return
 	}
 
 	log.Println("Successfully loaded saved CT indexes")
@@ -280,6 +300,11 @@ func (m *LogMetrics) SaveCertIndexes(ctIndexFilePath string) error {
 		return err
 	}
 
+	// Keep one generation of the previous index file as .bak so a corrupted
+	// main file can be recovered automatically on the next start.
+	// Best effort - the file does not exist on the first save.
+	_ = os.Rename(ctIndexFilePath, ctIndexFilePath+".bak")
+
 	// Atomically move the temp file to the permanent file
 	renameErr := os.Rename(tempFilePath, ctIndexFilePath)
 	if renameErr != nil {
@@ -319,12 +344,12 @@ func storeTempFile(tempFilePath string, bytes []byte) error {
 
 // GetProcessedCerts returns the total number of processed certificates.
 func GetProcessedCerts() int64 {
-	return ProcessedCerts
+	return atomic.LoadInt64(&ProcessedCerts)
 }
 
 // GetProcessedPrecerts returns the total number of processed precertificates.
 func GetProcessedPrecerts() int64 {
-	return ProcessedPrecerts
+	return atomic.LoadInt64(&ProcessedPrecerts)
 }
 
 // GetCertMetrics returns a copy of the internal metrics map.

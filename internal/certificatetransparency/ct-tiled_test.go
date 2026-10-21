@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	ct "github.com/google/certificate-transparency-go"
 	"golang.org/x/crypto/cryptobyte"
@@ -84,6 +85,11 @@ type fakeTiledLog struct {
 	mu       sync.Mutex
 	size     uint64
 	requests map[string]int
+	// failTiles makes the next n tile requests return 404 - simulating a tile
+	// that the checkpoint already announces but that is not yet uploaded.
+	failTiles int
+	// failCheckpoints makes the next n checkpoint requests return 404.
+	failCheckpoints int
 }
 
 func newFakeTiledLog(t *testing.T, size uint64) (*fakeTiledLog, *httptest.Server) {
@@ -124,6 +130,13 @@ func (l *fakeTiledLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	l.requests[r.URL.Path]++
 
 	if r.URL.Path == "/checkpoint" {
+		if l.failCheckpoints > 0 {
+			l.failCheckpoints--
+			http.NotFound(w, r)
+
+			return
+		}
+
 		fmt.Fprintf(w, "example.com/log\n%d\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n", l.size)
 		return
 	}
@@ -131,6 +144,13 @@ func (l *fakeTiledLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tilePath, ok := strings.CutPrefix(r.URL.Path, "/tile/data/")
 	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+
+	if l.failTiles > 0 {
+		l.failTiles--
+		http.NotFound(w, r)
+
 		return
 	}
 
@@ -329,5 +349,78 @@ func TestStaticCTClient_DeferPartialTiles(t *testing.T) {
 
 	if got := log.tileRequests(); got != tileRequests {
 		t.Errorf("idle polls fetched %d tiles, want 0", got-tileRequests)
+	}
+}
+
+// TestStaticCTClient_MonitorAbsorbsTransientFailures verifies that a transient
+// fetch error - e.g. a tile that the checkpoint announces before it is uploaded
+// - is retried inside Monitor instead of escalating to a worker restart.
+func TestStaticCTClient_MonitorAbsorbsTransientFailures(t *testing.T) {
+	log, srv := newFakeTiledLog(t, 256)
+	// The first three tile requests fail as if the tile was not yet uploaded.
+	log.failTiles = 3
+
+	c := NewStaticCTClient(srv.URL, srv.Client(), "test", 0)
+	c.backoff.Min = time.Millisecond
+	c.backoff.Max = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	var indexes []uint64
+	collect := func(e *ct.RawLogEntry) {
+		mu.Lock()
+		indexes = append(indexes, uint64(e.Index))
+		mu.Unlock()
+	}
+
+	err := c.Monitor(ctx, collect, collect)
+	if err == nil {
+		t.Fatal("Monitor returned nil error instead of context error")
+	}
+	if !strings.Contains(err.Error(), "context") {
+		t.Fatalf("Monitor returned fetch error instead of context error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(indexes) != 256 {
+		t.Fatalf("got %d entries, want 256", len(indexes))
+	}
+	for i, idx := range indexes {
+		if idx != uint64(i) {
+			t.Fatalf("entry %d has index %d, want %d", i, idx, i)
+		}
+	}
+}
+
+// TestStaticCTClient_MonitorEscalatesPersistentFailures verifies that
+// consecutive failures beyond maxConsecutiveFailures are returned to the
+// caller so the worker can restart.
+func TestStaticCTClient_MonitorEscalatesPersistentFailures(t *testing.T) {
+	log, srv := newFakeTiledLog(t, 256)
+	// Every checkpoint fetch fails - the error must propagate eventually.
+	log.failCheckpoints = 100
+
+	c := NewStaticCTClient(srv.URL, srv.Client(), "test", 0)
+	c.backoff.Min = time.Millisecond
+	c.backoff.Max = 5 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Monitor(context.Background(), func(*ct.RawLogEntry) {}, func(*ct.RawLogEntry) {})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Monitor returned nil error on persistent failures")
+		}
+		if !strings.Contains(err.Error(), "checkpoint") {
+			t.Fatalf("expected checkpoint error, got: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Monitor did not escalate persistent failures")
 	}
 }
