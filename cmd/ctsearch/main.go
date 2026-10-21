@@ -28,6 +28,7 @@ var (
 	flagDB         = flag.String("clickhouse-db", "certstream", "clickhouse database")
 	flagTable      = flag.String("clickhouse-table", "certs", "clickhouse table")
 	flagIdxTable   = flag.String("clickhouse-idx-table", "certs_idx", "cert_index->domain lookup table (empty = direct scan)")
+	flagDomTable   = flag.String("clickhouse-dom-table", "certs_dom", "domain_rev->(domain,cert_index) table ordered by domain_rev (empty = disabled)")
 	flagUser       = flag.String("clickhouse-user", "ctscan", "clickhouse user")
 	flagCHPassFile = flag.String("clickhouse-password-file", "", "file containing the clickhouse password")
 	flagCHPass     = flag.String("clickhouse-password", "", "clickhouse password")
@@ -83,6 +84,19 @@ type parsed struct {
 	// two-phase queries whose predicate touches domain columns alone.
 	p1where string
 	p1args  []any
+	// domwhere/domargs give the equivalent predicate on certs_dom, which
+	// is ordered by domain_rev: suffix scopes turn into prefix ranges and
+	// seek instead of scanning. Takes precedence over p1where when the
+	// dom table is configured.
+	domwhere string
+	domargs  []any
+	// p2where/p2args optionally replace where for the phase-2 row
+	// re-application. Domain-scope queries keep where = root_domain = ?
+	// (bloom-pruned fallback phase 1) but must filter phase-2 rows by the
+	// exact domain predicate - a bare subdomain like www.x.com has no
+	// root_domain value and would return empty otherwise.
+	p2where string
+	p2args  []any
 }
 
 func likeEsc(s string) string {
@@ -107,11 +121,11 @@ func parseQuery(q string) parsed {
 	switch {
 	case strings.HasPrefix(low, "fp:") || strings.HasPrefix(low, "fingerprint:"):
 		v := q[strings.Index(q, ":")+1:]
-		return parsed{`fingerprint = ?`, []any{v}, "fingerprint", true, false, "", nil}
+		return parsed{`fingerprint = ?`, []any{v}, "fingerprint", true, false, "", nil, "", nil, "", nil}
 	case strings.HasPrefix(low, "serial:"):
-		return parsed{`serial_number = ?`, []any{q[7:]}, "serial", true, false, "", nil}
+		return parsed{`serial_number = ?`, []any{q[7:]}, "serial", true, false, "", nil, "", nil, "", nil}
 	case strings.HasPrefix(low, "cn:"):
-		return parsed{`cn = ?`, []any{q[3:]}, "subject CN", true, false, "", nil}
+		return parsed{`cn = ?`, []any{q[3:]}, "subject CN", true, false, "", nil, "", nil, "", nil}
 	case strings.HasPrefix(low, "idx:"):
 		n, _ := strconv.ParseUint(q[4:], 10, 64)
 		return idxPred(n)
@@ -123,7 +137,7 @@ func parseQuery(q string) parsed {
 		return idxPred(n)
 	}
 	if isHex64(q) {
-		return parsed{`fingerprint = ?`, []any{low}, "fingerprint", true, false, "", nil}
+		return parsed{`fingerprint = ?`, []any{low}, "fingerprint", true, false, "", nil, "", nil, "", nil}
 	}
 
 	if strings.HasPrefix(q, "%.") || strings.HasPrefix(q, "*.") {
@@ -135,6 +149,8 @@ func parseQuery(q string) parsed {
 			sfx := "." + strings.ToLower(suffix)
 			return parsed{
 				`tld = ?`, []any{strings.ToLower(suffix)}, "TLD suffix", false, false,
+				`endsWith(domain, ?)`, []any{sfx},
+				`startsWith(domain_rev, ?)`, []any{revStr(sfx)},
 				`endsWith(domain, ?)`, []any{sfx},
 			}
 		}
@@ -149,12 +165,13 @@ func parseQuery(q string) parsed {
 			pat = strings.ReplaceAll(pat, `\`, `\\`)
 			pat = strings.ReplaceAll(pat, `_`, `\_`)
 			return parsed{`domain LIKE ?`, []any{"%" + pat}, "name substring", false, false,
-				`domain LIKE ?`, []any{"%" + pat}}
+				`domain LIKE ?`, []any{"%" + pat}, "", nil, "", nil}
 		}
 		// plain leading wildcard: domain suffix - no PK prefix to seek on,
-		// but certs_idx's ngram index skips granules that lack the trigrams
+		// but as a reversed prefix it seeks on certs_dom
 		return parsed{`domain LIKE ?`, []any{"%" + likeEsc(strings.ToLower(rest))},
-			"name suffix", false, false, `endsWith(domain, ?)`, []any{strings.ToLower(rest)}}
+			"name suffix", false, false, `endsWith(domain, ?)`, []any{strings.ToLower(rest)},
+			`startsWith(domain_rev, ?)`, []any{revStr(strings.ToLower(rest))}, "", nil}
 	}
 	if strings.ContainsAny(q, "%*") {
 		// wildcard anywhere else: * and % are wildcards, _ and \ escape.
@@ -163,7 +180,7 @@ func parseQuery(q string) parsed {
 		pat := strings.ReplaceAll(low, "*", "%")
 		pat = strings.ReplaceAll(pat, `\`, `\\`)
 		pat = strings.ReplaceAll(pat, `_`, `\_`)
-		return parsed{`domain LIKE ?`, []any{pat}, "name pattern", true, false, "", nil}
+		return parsed{`domain LIKE ?`, []any{pat}, "name pattern", true, false, "", nil, "", nil, "", nil}
 	}
 	// plain name: root_domain = ? covers apex + all subdomains (apex rows
 	// have root_domain = themselves) - single bloom-indexed predicate.
@@ -171,7 +188,9 @@ func parseQuery(q string) parsed {
 	// two-phase: a bare domain can match millions of certs (example.com
 	// style), so sorting whole rows in one pass blows up - phase-1 sorts
 	// only cert_index UInt64s, phase-2 refetches the few display rows
-	return parsed{`root_domain = ?`, []any{low}, "domain + subdomains", false, false, "", nil}
+	dw, da := domScope(low)
+	return parsed{`root_domain = ?`, []any{low}, "domain + subdomains", false, false, "", nil,
+		dw, da, `domain = ? OR endsWith(domain, ?)`, []any{low, "." + low}}
 }
 
 // idxPred builds the cert_index predicate. With the certs_idx lookup
@@ -183,9 +202,9 @@ func idxPred(n uint64) parsed {
 		w := fmt.Sprintf(
 			`domain IN (SELECT domain FROM %s WHERE cert_index = %d) AND cert_index = %d`,
 			idxTbl, n, n)
-		return parsed{w, nil, "cert index", true, false, "", nil}
+		return parsed{w, nil, "cert index", true, false, "", nil, "", nil, "", nil}
 	}
-	return parsed{`cert_index = ?`, []any{n}, "cert index", true, false, "", nil}
+	return parsed{`cert_index = ?`, []any{n}, "cert index", true, false, "", nil, "", nil, "", nil}
 }
 
 // suffixQuery handles %.example.com - the root_domain bloom index skips
@@ -209,8 +228,9 @@ func suffixQuery(suffix string) parsed {
 	args := []any{root, rev, rev + ".%"}
 	// no p1where: rare suffixes early-terminate badly on certs_idx since it
 	// is ordered by cert_index - a sparse match forces a full-table scan.
-	// root_domain's bloom index on the wide table prunes far better here.
-	return parsed{where, args, "subdomain names", false, false, "", nil}
+	// certs_dom's domain_rev ordering turns the suffix into a prefix range.
+	dw, da := domScope(suffix)
+	return parsed{where, args, "subdomain names", false, false, "", nil, dw, da, "", nil}
 }
 
 // namesQuery handles names:x - a domain-only predicate evaluated
@@ -222,7 +242,7 @@ func suffixQuery(suffix string) parsed {
 func namesQuery(sub string) parsed {
 	s := strings.ToLower(strings.TrimSpace(sub))
 	mk := func(w string, args ...any) parsed {
-		return parsed{w, args, "distinct names", false, true, "", nil}
+		return parsed{w, args, "distinct names", false, true, "", nil, "", nil, "", nil}
 	}
 	suffixPred := func(sfx string) parsed {
 		// labels(sfx)>=2: root_domain=last2 prunes granules, then
@@ -270,6 +290,15 @@ func lastTwoLabels(s string) string {
 		}
 	}
 	return s
+}
+
+// domScope builds the certs_dom predicate covering apex and all
+// subdomains of d: the reversed name itself plus its "."-prefixed
+// extension. Bounded ranges - no false positives from hyphenated
+// lookalikes (moc.buhtig-x is outside both ranges).
+func domScope(d string) (string, []any) {
+	r := revStr(d)
+	return `domain_rev = ? OR startsWith(domain_rev, ?)`, []any{r, r + "."}
 }
 
 // revStr reverses a domain string: "x.example.com" -> "moc.elpmaxe.x"
@@ -650,7 +679,19 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 		// ORDER BY over giant hostnames strings blows server memory otherwise)
 		p1table := flagDBOr() + "." + flagTableOr()
 		p1where, p1args := where, args
-		if pq.p1where != "" && flagIdxOr() != "" {
+		switch {
+		case pq.domwhere != "" && flagDomOr() != "":
+			// domain-scope predicates seek on certs_dom: the domain_rev
+			// ordering turns suffix scopes into bounded prefix ranges
+			p1table = flagDomOr()
+			p1where = "(" + pq.domwhere + ")"
+			p1args = append([]any{}, pq.domargs...)
+			if after > 0 {
+				p1where += " AND cert_index > ?"
+				p1args = append(p1args, after)
+			}
+			p1args = append(p1args, *flagLimit+1)
+		case pq.p1where != "" && flagIdxOr() != "":
 			// domain-only predicates scan the narrow certs_idx instead - its
 			// (cert_index, domain) sort order also lets ORDER BY cert_index
 			// early-terminate at the LIMIT
@@ -724,13 +765,24 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 			}
 			// re-apply the user's predicate: each row is one SAN, and a cert
 			// covering both the searched name and unrelated SANs would else
-			// show those siblings too. No ORDER BY - sorting would make CH
-			// buffer every row before emitting the first; granule order is
-			// fine and lets rows stream out as they are read.
-			pred = where + ` AND ` + pred
+			// show those siblings too. Domain-scope queries substitute the
+			// SAN-exact p2where here - a bare subdomain has no root_domain
+			// value and would match nothing otherwise. No ORDER BY - sorting
+			// would make CH buffer every row before emitting the first;
+			// granule order is fine and lets rows stream out as they are read.
+			p2, p2a := where, args[:len(args)-1]
+			if pq.p2where != "" {
+				p2 = "(" + pq.p2where + ")"
+				p2a = append([]any{}, pq.p2args...)
+				if after > 0 {
+					p2 += " AND cert_index > ?"
+					p2a = append(p2a, after)
+				}
+			}
+			pred = p2 + ` AND ` + pred
 			rows, err := chConn.Query(qctx,
 				`SELECT `+cols+` FROM `+flagDBOr()+`.`+flagTableOr()+`
-				 WHERE `+pred, args[:len(args)-1]...)
+				 WHERE `+pred, p2a...)
 			if err != nil {
 				qErr = err.Error()
 			} else {
@@ -994,6 +1046,12 @@ func flagIdxOr() string {
 		return ""
 	}
 	return flagDBOr() + "." + *flagIdxTable
+}
+func flagDomOr() string {
+	if *flagDomTable == "" {
+		return ""
+	}
+	return flagDBOr() + "." + *flagDomTable
 }
 
 func main() {
