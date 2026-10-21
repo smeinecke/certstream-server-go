@@ -76,7 +76,10 @@ func (e *Entry) JSONDomains() []byte {
 
 // entryToJSONBytes encodes an Entry to a JSON byte slice.
 func (e *Entry) entryToJSONBytes() []byte {
+	// Pre-size the buffer: a lite entry is ~2KB, full with chain ~8KB - one
+	// allocation avoids repeated growth copies during encoding.
 	buf := bytes.Buffer{}
+	buf.Grow(4096)
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 
