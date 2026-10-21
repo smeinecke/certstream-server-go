@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -319,12 +320,12 @@ func storeTempFile(tempFilePath string, bytes []byte) error {
 
 // GetProcessedCerts returns the total number of processed certificates.
 func GetProcessedCerts() int64 {
-	return ProcessedCerts
+	return atomic.LoadInt64(&ProcessedCerts)
 }
 
 // GetProcessedPrecerts returns the total number of processed precertificates.
 func GetProcessedPrecerts() int64 {
-	return ProcessedPrecerts
+	return atomic.LoadInt64(&ProcessedPrecerts)
 }
 
 // GetCertMetrics returns a copy of the internal metrics map.
