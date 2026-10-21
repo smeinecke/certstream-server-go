@@ -119,23 +119,32 @@ func (bm *Dispatcher) GetSkippedCerts() map[string]uint64 {
 // broadcaster is run in a goroutine and handles the dispatching of certs to clients.
 func (bm *Dispatcher) broadcaster() {
 	for {
-		var data []byte
-
-		// Take entry out of broadcast channel and generate JSON representations for the entry.
+		// Take entry out of broadcast channel.
 		entry := <-bm.MessageQueue
-		dataLite := entry.JSONLite()
-		dataFull := entry.JSON()
-		dataDomain := entry.JSONDomains()
 
 		bm.clientLock.RLock()
 
+		// Marshal each representation only when a client of that type is
+		// connected - with a single lite client this avoids two wasted
+		// encodes per entry.
+		var dataLite, dataFull, dataDomain []byte
 		for _, c := range bm.clients {
+			var data []byte
 			switch c.SubType() {
 			case SubTypeLite:
+				if dataLite == nil {
+					dataLite = entry.JSONLite()
+				}
 				data = dataLite
 			case SubTypeFull:
+				if dataFull == nil {
+					dataFull = entry.JSON()
+				}
 				data = dataFull
 			case SubTypeDomain:
+				if dataDomain == nil {
+					dataDomain = entry.JSONDomains()
+				}
 				data = dataDomain
 			default:
 				// This should never happen, but if it does, we log it and skip the client.
