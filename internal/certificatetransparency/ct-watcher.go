@@ -504,6 +504,16 @@ func (w *worker) runTiledWorker(ctx context.Context) error {
 	return nil
 }
 
+// parseEntry routes through the slim or full parser depending on the
+// slim_broadcast config. Slim skips chain parsing + DER materialization
+// - the bulk of per-cert CPU when no consumer needs those fields.
+func (w *worker) parseEntry(rawEntry *ct.RawLogEntry, logType string) (models.Entry, error) {
+	if config.AppConfig.General.SlimBroadcast {
+		return ParseCertstreamEntrySlim(rawEntry, w.operatorName, w.name, w.ctURL, logType)
+	}
+	return ParseCertstreamEntry(rawEntry, w.operatorName, w.name, w.ctURL, logType)
+}
+
 // foundCertCallback is the callback that handles cases where new regular certs are found.
 func (w *worker) foundCertCallback(rawEntry *ct.RawLogEntry) {
 	logType := models.SourceIsRFC6962
@@ -511,7 +521,7 @@ func (w *worker) foundCertCallback(rawEntry *ct.RawLogEntry) {
 		logType = models.SourceIsTiled
 	}
 
-	entry, parseErr := ParseCertstreamEntry(rawEntry, w.operatorName, w.name, w.ctURL, logType)
+	entry, parseErr := w.parseEntry(rawEntry, logType)
 	if parseErr != nil {
 		log.Println("Error parsing certstream entry: ", parseErr)
 		return
@@ -530,7 +540,7 @@ func (w *worker) foundPrecertCallback(rawEntry *ct.RawLogEntry) {
 		logType = models.SourceIsTiled
 	}
 
-	entry, parseErr := ParseCertstreamEntry(rawEntry, w.operatorName, w.name, w.ctURL, logType)
+	entry, parseErr := w.parseEntry(rawEntry, logType)
 	if parseErr != nil {
 		log.Println("Error parsing certstream entry: ", parseErr)
 		return

@@ -22,7 +22,9 @@ import (
 )
 
 // parseData converts a *ct.RawLogEntry struct into a certstream.Data struct by copying some values and calculating others.
-func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL, logType string) (models.Data, error) {
+// When slim is set, the certificate chain is not parsed and no DER/base64 data is materialized -
+// intended for consumers that only need leaf fields.
+func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL, logType string, slim bool) (models.Data, error) {
 	var certLink string
 	// There is no direct link for tiled ct logs
 	if logType == models.SourceIsRFC6962 {
@@ -75,7 +77,7 @@ func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL, logType stri
 	}
 
 	// Calculate certificate hash from the raw DER bytes of the certificate
-	data.LeafCert = leafCertFromX509cert(*cert)
+	data.LeafCert = leafCertFromX509cert(*cert, !slim)
 
 	// recalculate hashes if the certificate is a precertificate
 	if isPrecert {
@@ -92,16 +94,17 @@ func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL, logType stri
 		data.LeafCert.Extensions.CTLPoisonByte = true
 	}
 
-	certAsDER := base64.StdEncoding.EncodeToString(entry.Cert.Data)
-	data.LeafCert.AsDER = certAsDER
+	if !slim {
+		certAsDER := base64.StdEncoding.EncodeToString(entry.Cert.Data)
+		data.LeafCert.AsDER = certAsDER
 
-	chain, parseErr := parseCertificateChain(logEntry)
-	if parseErr != nil {
-		log.Println("Could not parse certificate chain: ", parseErr)
-		return models.Data{}, parseErr
+		chain, parseErr := parseCertificateChain(logEntry)
+		if parseErr != nil {
+			log.Println("Could not parse certificate chain: ", parseErr)
+			return models.Data{}, parseErr
+		}
+		data.Chain = chain
 	}
-
-	data.Chain = chain
 
 	return data, nil
 }
@@ -116,7 +119,7 @@ func parseCertificateChain(logEntry *ct.LogEntry) ([]models.LeafCert, error) {
 			return nil, fmt.Errorf("could not parse certificate: %w", parseErr)
 		}
 
-		leafCert := leafCertFromX509cert(*myCert)
+		leafCert := leafCertFromX509cert(*myCert, true)
 		chain[i] = leafCert
 	}
 
@@ -124,7 +127,8 @@ func parseCertificateChain(logEntry *ct.LogEntry) ([]models.LeafCert, error) {
 }
 
 // leafCertFromX509cert converts a x509.Certificate to the custom LeafCert data structure.
-func leafCertFromX509cert(cert x509.Certificate) models.LeafCert {
+// withDER controls whether the base64 AsDER field is materialized (skipped by slim consumers).
+func leafCertFromX509cert(cert x509.Certificate, withDER bool) models.LeafCert {
 	leafCert := models.LeafCert{
 		AllDomains:         cert.DNSNames,
 		Extensions:         models.Extensions{},
@@ -151,7 +155,9 @@ func leafCertFromX509cert(cert x509.Certificate) models.LeafCert {
 
 	leafCert.Issuer = buildSubject(cert.Issuer)
 
-	leafCert.AsDER = base64.StdEncoding.EncodeToString(cert.Raw)
+	if withDER {
+		leafCert.AsDER = base64.StdEncoding.EncodeToString(cert.Raw)
+	}
 	leafCert.Fingerprint = calculateSHA1(cert.Raw)
 	leafCert.SHA1 = leafCert.Fingerprint
 	leafCert.SHA256 = calculateSHA256(cert.Raw)
@@ -430,11 +436,21 @@ func keyUsageToString(k x509.KeyUsage) string {
 
 // ParseCertstreamEntry creates an Entry from a ct.RawLogEntry.
 func ParseCertstreamEntry(rawEntry *ct.RawLogEntry, operatorName, logname, ctURL, logType string) (models.Entry, error) {
+	return parseEntry(rawEntry, operatorName, logname, ctURL, logType, false)
+}
+
+// ParseCertstreamEntrySlim is like ParseCertstreamEntry but skips chain parsing
+// and DER materialization - for consumers that only need leaf fields.
+func ParseCertstreamEntrySlim(rawEntry *ct.RawLogEntry, operatorName, logname, ctURL, logType string) (models.Entry, error) {
+	return parseEntry(rawEntry, operatorName, logname, ctURL, logType, true)
+}
+
+func parseEntry(rawEntry *ct.RawLogEntry, operatorName, logname, ctURL, logType string, slim bool) (models.Entry, error) {
 	if rawEntry == nil {
 		return models.Entry{}, ErrEntryNil
 	}
 
-	data, err := parseData(rawEntry, operatorName, logname, ctURL, logType)
+	data, err := parseData(rawEntry, operatorName, logname, ctURL, logType, slim)
 	if err != nil {
 		return models.Entry{}, err
 	}

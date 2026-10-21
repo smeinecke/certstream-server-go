@@ -22,7 +22,11 @@ type General struct {
 	BufferSizes BufferSizes `mapstructure:"buffer_sizes"`
 	// DropOldLogs indicates whether downloading CT-Logs should start at the latest index (true) or should from the beginning (false).
 	DropOldLogs *bool `mapstructure:"drop_old_logs"`
-	Recovery    struct {
+	// SlimBroadcast parses only the leaf certificate per entry - skips
+	// chain parsing and DER/base64 materialization. Broadcast output
+	// keeps every leaf field but carries an empty chain and no as_der.
+	SlimBroadcast bool `mapstructure:"slim_broadcast"`
+	Recovery      struct {
 		Enabled     bool   `mapstructure:"enabled"`
 		CTIndexFile string `mapstructure:"ct_index_file"`
 	} `mapstructure:"recovery"`
