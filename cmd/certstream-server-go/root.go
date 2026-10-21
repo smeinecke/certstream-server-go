@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -40,6 +42,15 @@ certificate transparency logs via websocket connections to connected clients.`,
 		_, statErr := os.Stat(configPath)
 		if os.IsNotExist(statErr) {
 			return fmt.Errorf("config file '%s' does not exist: %w", configPath, statErr)
+		}
+
+		// Optional pprof endpoint for profiling - disabled unless
+		// CERTSTREAM_PPROF_ADDR is set (e.g. "127.0.0.1:6060").
+		if pprofAddr := os.Getenv("CERTSTREAM_PPROF_ADDR"); pprofAddr != "" {
+			go func() {
+				log.Printf("pprof listening on %s\n", pprofAddr)
+				log.Println(http.ListenAndServe(pprofAddr, nil))
+			}()
 		}
 
 		certstreamServer, err := certstream.NewCertstreamFromConfigFile(configPath)

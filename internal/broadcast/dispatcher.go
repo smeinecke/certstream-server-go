@@ -127,24 +127,42 @@ func (bm *Dispatcher) broadcaster() {
 		// Marshal each representation only when a client of that type is
 		// connected - with a single lite client this avoids two wasted
 		// encodes per entry.
+		var needLite, needFull, needDomain bool
+		for _, c := range bm.clients {
+			switch c.SubType() {
+			case SubTypeLite:
+				needLite = true
+			case SubTypeFull:
+				needFull = true
+			case SubTypeDomain:
+				needDomain = true
+			}
+		}
+
 		var dataLite, dataFull, dataDomain []byte
+		if needFull {
+			dataFull = entry.JSONNoCache()
+		}
+		if needDomain {
+			dataDomain = entry.JSONDomains()
+		}
+		if needLite {
+			// The broadcaster owns a private copy of the entry - strip the
+			// fields in place instead of cloning. Must run after the full
+			// representation has been marshaled.
+			entry.Data.Chain = nil
+			entry.Data.LeafCert.AsDER = ""
+			dataLite = entry.JSONNoCache()
+		}
+
 		for _, c := range bm.clients {
 			var data []byte
 			switch c.SubType() {
 			case SubTypeLite:
-				if dataLite == nil {
-					dataLite = entry.JSONLite()
-				}
 				data = dataLite
 			case SubTypeFull:
-				if dataFull == nil {
-					dataFull = entry.JSON()
-				}
 				data = dataFull
 			case SubTypeDomain:
-				if dataDomain == nil {
-					dataDomain = entry.JSONDomains()
-				}
 				data = dataDomain
 			default:
 				// This should never happen, but if it does, we log it and skip the client.
