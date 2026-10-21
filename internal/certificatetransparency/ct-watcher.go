@@ -569,20 +569,25 @@ func certHandler(entryChan chan models.Entry) {
 	}
 }
 
+// sharedTransport is used by all workers - sharing one transport pools
+// connections across hosts in a single pool instead of one pool per
+// worker, which saves memory and idle connections.
+// MaxIdleConns is raised to accommodate all workers sharing the pool
+// (~50 logs x up to 10 idle conns per host).
+var sharedTransport = &http.Transport{
+	TLSHandshakeTimeout:   30 * time.Second,
+	ResponseHeaderTimeout: 30 * time.Second,
+	MaxIdleConnsPerHost:   10,
+	DisableKeepAlives:     false,
+	MaxIdleConns:          500,
+	IdleConnTimeout:       90 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
 // newHTTPClient creates a new http.Client with reasonable timeouts and connection settings for interacting with CT logs.
 func newHTTPClient() *http.Client {
-	httpClient := http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			MaxIdleConnsPerHost:   10,
-			DisableKeepAlives:     false,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: sharedTransport,
 	}
-
-	return &httpClient
 }
