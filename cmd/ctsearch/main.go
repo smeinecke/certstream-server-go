@@ -214,19 +214,35 @@ func suffixQuery(suffix string) parsed {
 }
 
 // namesQuery handles names:x - a domain-only predicate evaluated
-// against certs_idx (cert_index, domain). Column set there is narrow,
-// so all filters must reference domain alone.
+// against certs (PK: domain). Boundary-aligned suffixes get a
+// root_domain bloom prefilter: domains whose last two labels equal
+// last2(sfx) are exactly the apex + subdomain set when sfx has 2
+// labels, and a strict superset otherwise. Mid-label suffixes and
+// substrings can't use it and stay column scans.
 func namesQuery(sub string) parsed {
 	s := strings.ToLower(strings.TrimSpace(sub))
 	mk := func(w string, args ...any) parsed {
 		return parsed{w, args, "distinct names", false, true, "", nil}
 	}
+	suffixPred := func(sfx string) parsed {
+		// labels(sfx)>=2: root_domain=last2 prunes granules, then
+		// domain/domain_rev finishes the job. When sfx itself is 2
+		// labels, root_domain alone is already equivalent.
+		if n := strings.Count(sfx, "."); n >= 2 {
+			l2 := lastTwoLabels(sfx)
+			return mk(`root_domain = ? AND (domain = ? OR endsWith(domain, ?))`,
+				l2, sfx, "."+sfx)
+		} else if n == 1 {
+			return mk(`root_domain = ?`, sfx)
+		}
+		// single-label suffix (%.de) - no root_domain value possible
+		return mk(`domain = ? OR endsWith(domain, ?)`, sfx, "."+sfx)
+	}
 	switch {
 	case s == "":
 		return mk(`domain != ''`)
 	case strings.HasPrefix(s, "%.") || strings.HasPrefix(s, "*."):
-		sfx := s[2:]
-		return mk(`domain = ? OR endsWith(domain, ?)`, sfx, "."+sfx)
+		return suffixPred(s[2:])
 	case strings.HasPrefix(s, "%") || strings.HasPrefix(s, "*"):
 		rest := s[1:]
 		if strings.ContainsAny(rest, "%*") {
@@ -242,10 +258,18 @@ func namesQuery(sub string) parsed {
 		pat = strings.ReplaceAll(pat, `_`, `\_`)
 		return mk(`domain LIKE ?`, pat)
 	default:
-		// bare name: apex + everything under it, matching root_domain
-		// semantics of the plain-name path
-		return mk(`domain = ? OR endsWith(domain, ?)`, s, "."+s)
+		return suffixPred(s)
 	}
+}
+
+// lastTwoLabels returns the final two dot-separated labels of s.
+func lastTwoLabels(s string) string {
+	if i := strings.LastIndex(s, "."); i > 0 {
+		if j := strings.LastIndex(s[:i], "."); j >= 0 {
+			return s[j+1:]
+		}
+	}
+	return s
 }
 
 // revStr reverses a domain string: "x.example.com" -> "moc.elpmaxe.x"
@@ -519,13 +543,10 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 	}
 
 	if pq.names {
-		// distinct-name aggregation over certs_idx. Pages are ordered
-		// alphabetically by domain; afterd carries the domain cursor.
-		idxTbl := flagIdxOr()
-		if idxTbl == "" {
-			qErr = "names: search requires the certs_idx lookup table"
-			return
-		}
+		// distinct-name aggregation on certs - domain is its leading PK,
+		// so exact/prefix filters seek and GROUP BY domain aggregates in
+		// order (rows stream out progressively). Pages are alphabetical;
+		// afterd carries the domain cursor.
 		nwhere := "(" + pq.where + ")"
 		nargs := append([]any{}, pq.args...)
 		if afterd != "" {
@@ -533,10 +554,10 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 			nargs = append(nargs, afterd)
 		}
 		nargs = append(nargs, *flagLimit+1)
-		status("aggregating distinct names on certs_idx")
+		status("aggregating distinct names")
 		nr, err := chConn.Query(qctx,
 			`SELECT domain, max(cert_index) AS mi, count() AS c
-			 FROM `+idxTbl+`
+			 FROM `+flagDBOr()+`.`+flagTableOr()+`
 			 WHERE `+nwhere+`
 			 GROUP BY domain
 			 ORDER BY domain ASC
