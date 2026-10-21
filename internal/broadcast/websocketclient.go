@@ -79,7 +79,13 @@ func (c *WebsocketClient) broadcastHandler() {
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
-		case message := <-c.broadcastChan:
+		case message, ok := <-c.broadcastChan:
+			// Channel closed via Close() on unregister - exit cleanly instead
+			// of spinning on nil messages.
+			if !ok {
+				return
+			}
+
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 
 			w, err := c.conn.NextWriter(websocket.TextMessage)

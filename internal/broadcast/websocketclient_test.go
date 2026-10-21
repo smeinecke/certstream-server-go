@@ -1,6 +1,12 @@
 package broadcast
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"time"
+
+	"github.com/gorilla/websocket"
 	"fmt"
 	"testing"
 )
@@ -139,5 +145,57 @@ func TestClientNameAlwaysContainsID(t *testing.T) {
 	expected := fmt.Sprintf("[%s]", "TESTID1X")
 	if len(got) < len(expected) || got[:len(expected)] != expected {
 		t.Errorf("Name() %q does not start with id prefix %q", got, expected)
+	}
+}
+
+// TestBroadcastHandlerExitsWhenChannelClosed verifies the broadcastHandler
+// goroutine exits cleanly when the client's broadcast channel is closed
+// (e.g. via UnregisterClient -> Close) instead of spinning on nil messages.
+func TestBroadcastHandlerExitsWhenChannelClosed(t *testing.T) {
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	done := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		defer close(done)
+
+		// Read until the peer closes the connection.
+		for {
+			if _, _, readErr := conn.ReadMessage(); readErr != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial test websocket: %v", err)
+	}
+	defer conn.Close()
+
+	client := &WebsocketClient{
+		conn: conn,
+		BaseClient: &BaseClient{
+			broadcastChan: make(chan []byte),
+			stopChan:      make(chan struct{}),
+			name:          "test",
+			subType:       SubTypeLite,
+		},
+	}
+
+	go client.broadcastHandler()
+	close(client.broadcastChan)
+
+	select {
+	case <-done:
+		// The handler exited and closed the connection via its defer.
+	case <-time.After(3 * time.Second):
+		t.Fatal("broadcastHandler did not exit after channel close")
 	}
 }
