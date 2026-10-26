@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,6 +23,9 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"golang.org/x/net/publicsuffix"
 )
+
+//go:embed openapi.yaml
+var openapiSpec string
 
 var (
 	flagListen     = flag.String("listen", "127.0.0.1:8088", "listen address")
@@ -400,7 +404,7 @@ vertical-align:-2px;margin-right:.4em}
 %.example.com = subdomains &nbsp;&middot;&nbsp; example.com = name + subdomains &nbsp;&middot;&nbsp;
 % and * wildcards anywhere (foo%, %brand%) &nbsp;&middot;&nbsp;
 names:&lt;filter&gt; = distinct names &nbsp;&middot;&nbsp; domain:&lt;d&gt; = root_domain field &nbsp;&middot;&nbsp;
-fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt;
+fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt; &middot; <a href="openapi.yaml">api</a>
 </p>
 <script>
 // cursor stack for prev-page navigation - cursors are forward-only, so
@@ -1105,6 +1109,10 @@ func main() {
 	mux.HandleFunc("/", indexHandler)
 	mux.HandleFunc("/search", searchHandler)
 	mux.HandleFunc("/cert/", certHandler)
+	mux.HandleFunc("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/yaml")
+		io.WriteString(w, openapiSpec)
+	})
 
 	srv := &http.Server{
 		Addr:              *flagListen,

@@ -1,0 +1,246 @@
+openapi: 3.1.0
+
+info:
+  title: ctsearch
+  version: "1.0.0"
+  summary: crt.sh-style certificate transparency search over ClickHouse
+  description: |
+    Search interface over the certstream.certs table - one row per
+    (certificate, SAN name) pair, populated from CT log ingestion by
+    certstream-server + certhoover.
+
+    All endpoints return HTML. The search endpoint additionally supports
+    Server-Sent Events for progressive result streaming (see the `Accept`
+    header notes on `/search`). There is no JSON API - row payloads are
+    HTML fragments intended for direct DOM insertion.
+
+    Deployment is behind a reverse proxy that terminates TLS and auth;
+    the app itself listens on localhost only.
+
+servers:
+  - url: https://sonar.greensec.de/ct
+    description: production (mounted under /ct/, auth at the proxy)
+  - url: http://127.0.0.1:8088
+    description: direct instance access (base path configurable via -base)
+
+tags:
+  - name: search
+    description: certificate and name search
+  - name: ui
+    description: browser pages
+
+paths:
+  /:
+    get:
+      tags: [ui]
+      summary: Search form
+      description: Landing page with the query input and syntax help.
+      responses:
+        "200":
+          description: HTML page
+          content:
+            text/html:
+              schema: { type: string }
+
+  /search:
+    get:
+      tags: [search]
+      summary: Search certificates
+      description: |
+        Executes a query and streams up to `-limit` rows (default 100)
+        plus one lookahead row that only signals page availability.
+
+        **Response format is content-negotiated via `Accept`:**
+
+        | Accept contains       | Behaviour |
+        |-----------------------|-----------|
+        | `text/event-stream`   | SSE stream: `row` / `status` / `end` / `err` events |
+        | `text/html`           | Instant-loading shell page; its inline script re-opens the same URL as an EventSource - survives response-buffering proxies |
+        | anything else (curl)  | Plain streaming HTML page, rows inline as they arrive |
+
+        **Query grammar** (value of `q`, case-insensitive prefixes,
+        domain literals lowercased):
+
+        | Syntax | Semantics | ClickHouse path |
+        |--------|-----------|-----------------|
+        | `example.com` | name + all subdomains | `certs_dom` domain_rev scope |
+        | `%.example.com`, `*.example.com` | subdomains only | `certs_dom` prefix seek |
+        | `%.de` | bare TLD suffix | `certs_dom` prefix seek |
+        | `%foo`, `*foo` | name suffix | `certs_dom` reversed prefix |
+        | `%foo%bar`, `*foo*` | substring | full domain scan |
+        | `foo%`, `foo*.com` | pattern with literal prefix | domain PK range scan |
+        | `domain:x` | literal `root_domain` field match (eTLD+1) | `certs_dom` when x is a valid eTLD+1, else `i_rd` bloom fallback |
+        | `names:<filter>` | distinct names + latest cert_index + row count | `GROUP BY domain` on certs |
+        | `fp:<hex>`, `fingerprint:<hex>`, bare 64-hex | SHA-256 fingerprint | `i_fp` bloom - slow |
+        | `serial:<n>` | serial number | `i_sn` bloom - slow |
+        | `cn:<name>` | subject CN exact | `i_cn` bloom - slow |
+        | `idx:<n>`, bare integer | cert_index | `certs_idx` + domain PK seeks |
+
+        **Pagination.** When a result set exceeds the page limit the
+        footer (`end` event / page footer) links `after=<cert_index>`
+        and `afterd=<domain>` cursor params plus `page=<n+1>`. `after`
+        is a cert_index lower bound; `afterd` is the domain cursor used
+        by `names:` pages and as a row-level tiebreak for single-phase
+        queries. Cursors are forward-only - the UI keeps a page->cursor
+        stack for "prev".
+
+        **Timing.** A server-side `-query-timeout` (default 285s) bounds
+        each query; a proxy read timeout above that is required for slow
+        paths (`fp:`/`serial:`/`cn:`/`substr` scans can run minutes).
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Query string - see grammar above
+          schema: { type: string }
+          examples:
+            domain:     { value: "github.com" }
+            subdomains: { value: "%.github.com" }
+            suffix:     { value: "%github.com" }
+            substring:  { value: "%github%" }
+            rootDomain: { value: "domain:github.com" }
+            names:      { value: "names:%.github.com" }
+            fingerprint: { value: "fp:8f41e5a3..." }
+            certIndex:  { value: "idx:6709227123" }
+        - name: after
+          in: query
+          required: false
+          description: cert_index cursor - rows with cert_index > after (forward-only)
+          schema: { type: integer, format: uint64, minimum: 0 }
+        - name: afterd
+          in: query
+          required: false
+          description: >
+            Domain cursor. For `names:` queries it is the strict
+            alphabetical continuation (`domain > afterd`). For
+            single-phase queries it pairs with `after` as a
+            `(cert_index, domain)` tuple cursor so sibling SAN rows at
+            a page boundary are not dropped.
+          schema: { type: string }
+        - name: page
+          in: query
+          required: false
+          description: Displayed page number (footer/prev-stack bookkeeping only)
+          schema: { type: integer, minimum: 1, default: 1 }
+      responses:
+        "200":
+          description: |
+            Always HTTP 200 once the handler is entered - query errors
+            arrive as an `err` SSE event or an inline error paragraph,
+            not as a non-200 status.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE event stream
+              examples:
+                stream:
+                  summary: Typical event sequence
+                  value: |
+                    : hb
+
+                    event: status
+                    data: phase 1: finding matching cert_index values
+
+                    event: row
+                    data: <tr>
+                    data: <td class="idx"><a href="cert/6710000001">6710000001</a></td>
+                    data: <td>2026-10-21</td>
+                    data: ...
+
+                    event: row
+                    data: <tr>
+                    data: ...
+
+                    event: status
+                    data: phase 2: fetching 101 certificate(s)
+
+                    event: end
+                    data: <p>domain + subdomains: 100 row(s)+ (page limit) in 0.8s &middot; page 1
+                    data: &nbsp; <a href="search?q=github.com&amp;after=6710000101&amp;page=2">next page &rarr;</a></p>
+            text/html:
+              schema:
+                type: string
+                description: >
+                  `Accept: text/html` returns the shell page (markup +
+                  loading widget + EventSource script). Other Accept
+                  values return the same markup streamed inline with
+                  `<tr>` rows appended as they are produced.
+        "400":
+          description: Never produced - bad input degrades to an empty result or error text
+          content:
+            text/html: { schema: { type: string } }
+
+  /cert/{cert_index}:
+    get:
+      tags: [search]
+      summary: Certificate detail page
+      description: >
+        Full certificate record for one cert_index: timestamps, subject
+        fields, complete SAN list, serial, fingerprint, signature
+        algorithm, AKI/SKI, AIA, key/extended key usage, basic
+        constraints, certificate policies, SCT list, tld, root_domain,
+        cert_link. Routed through certs_idx so the lookup is domain-PK
+        seeks, not a wide-table scan.
+      parameters:
+        - name: cert_index
+          in: path
+          required: true
+          description: certstream-assigned certificate index
+          schema: { type: integer, format: uint64 }
+      responses:
+        "200":
+          description: >
+            HTML detail page. A non-numeric index renders "bad cert
+            index"; an unknown index renders "not found" - both still
+            HTTP 200.
+          content:
+            text/html:
+              schema: { type: string }
+
+  /openapi.yaml:
+    get:
+      tags: [ui]
+      summary: This specification
+      responses:
+        "200":
+          description: OpenAPI document
+          content:
+            application/yaml:
+              schema: { type: string }
+
+components:
+  schemas:
+    Row:
+      type: object
+      description: >
+        One search-result row (rendered as an HTML `<tr>` fragment in
+        SSE `row` events and inline pages). `hostnames` is the cert's
+        full SAN list as a JSON string, display-truncated to 200 chars.
+      properties:
+        cert_index:  { type: integer, format: uint64 }
+        seen:        { type: string, format: date-time, description: ingestion timestamp }
+        not_before:  { type: integer, format: uint64, description: unix seconds }
+        not_after:   { type: integer, format: uint64, description: unix seconds }
+        cn:          { type: string, description: subject common name }
+        domain:      { type: string, description: the SAN name this row represents }
+        serial_number: { type: string }
+        o:           { type: string, description: subject organization }
+        hostnames:   { type: string, description: JSON array of all SAN names }
+    NameRow:
+      type: object
+      description: One `names:` aggregation row (HTML `<tr>` fragment).
+      properties:
+        domain:    { type: string }
+        cert_index: { type: integer, format: uint64, description: newest cert carrying the name }
+        count:      { type: integer, format: uint64, description: SAN rows containing the name }
+    SSEEvents:
+      type: object
+      description: |
+        Events emitted on the text/event-stream response of /search:
+        - `row`     - one result row as an HTML `<tr>` fragment
+        - `status`  - human-readable phase text, throttled to one per 2s
+        - `end`     - terminal footer HTML (count, elapsed, next-page link)
+        - `err`     - terminal error text
+        - `: hb`    - comment heartbeat every 15s during silent phases
+      properties: {}
