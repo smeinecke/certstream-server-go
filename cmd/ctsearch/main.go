@@ -20,6 +20,7 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"golang.org/x/net/publicsuffix"
 )
 
 var (
@@ -131,6 +132,20 @@ func parseQuery(q string) parsed {
 		return idxPred(n)
 	case strings.HasPrefix(low, "names:"):
 		return namesQuery(strings.TrimSpace(q[6:]))
+	case strings.HasPrefix(low, "domain:"):
+		// explicit root_domain field search: matches the eTLD+1 value
+		// literally. When the input is itself a valid eTLD+1,
+		// root_domain(d)=X is exactly domScope(X) - certs_dom can find the
+		// cert indexes and phase 2 re-applies root_domain = ? verbatim.
+		// Otherwise (public suffix like co.uk, or a deeper name) the
+		// scopes differ, so phase 1 falls back to the certs bloom index.
+		v := strings.ToLower(strings.TrimSpace(q[7:]))
+		p := parsed{`root_domain = ?`, []any{v}, "root domain",
+			false, false, "", nil, "", nil, `root_domain = ?`, []any{v}}
+		if e1, err := publicsuffix.EffectiveTLDPlusOne(v); err == nil && e1 == v {
+			p.domwhere, p.domargs = domScope(v)
+		}
+		return p
 	}
 
 	if n, err := strconv.ParseUint(q, 10, 64); err == nil {
@@ -384,7 +399,7 @@ vertical-align:-2px;margin-right:.4em}
 <p class="hint">
 %.example.com = subdomains &nbsp;&middot;&nbsp; example.com = name + subdomains &nbsp;&middot;&nbsp;
 % and * wildcards anywhere (foo%, %brand%) &nbsp;&middot;&nbsp;
-names:&lt;filter&gt; = distinct names &nbsp;&middot;&nbsp;
+names:&lt;filter&gt; = distinct names &nbsp;&middot;&nbsp; domain:&lt;d&gt; = root_domain field &nbsp;&middot;&nbsp;
 fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt;
 </p>
 <script>

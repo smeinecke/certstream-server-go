@@ -66,6 +66,41 @@ func TestParseQuerySubdomainPhase2(t *testing.T) {
 	}
 }
 
+func TestParseQueryDomainKeyword(t *testing.T) {
+	// domain: searches the root_domain field literally. For a valid
+	// eTLD+1 input, phase 1 can still seek certs_dom (scope is exactly
+	// equivalent) while phase 2 re-applies root_domain = ? verbatim.
+	p := parseQuery("domain:github.com")
+	if p.where != `root_domain = ?` || p.args[0] != "github.com" {
+		t.Fatalf("where/args = %q %v", p.where, p.args)
+	}
+	if p.p2where != `root_domain = ?` || p.p2args[0] != "github.com" {
+		t.Fatalf("p2 = %q %v - root_domain must be re-applied", p.p2where, p.p2args)
+	}
+	if p.domwhere == "" {
+		t.Fatal("eTLD+1 input should still phase-1 through certs_dom")
+	}
+
+	// A public suffix is not a valid eTLD+1 - no certs_dom shortcut or
+	// co.uk would wrongly cover every domain under the suffix.
+	p = parseQuery("domain:co.uk")
+	if p.where != `root_domain = ?` || p.args[0] != "co.uk" {
+		t.Fatalf("where/args = %q %v", p.where, p.args)
+	}
+	if p.domwhere != "" {
+		t.Fatalf("domwhere %q set for public-suffix input", p.domwhere)
+	}
+
+	// A deeper name is not eTLD+1 either - stays literal.
+	p = parseQuery("domain:www.github.com")
+	if p.domwhere != "" {
+		t.Fatalf("domwhere set for non-eTLD+1 input: %q", p.domwhere)
+	}
+	if p.args[0] != "www.github.com" {
+		t.Fatalf("args = %v", p.args)
+	}
+}
+
 func TestParseQuerySuffixCoversApex(t *testing.T) {
 	// %.github.com keeps the certs-side predicate for phase-2 row
 	// suppression AND gains the certs_dom range for phase-1.
