@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/d-Rickyy-b/certstream-server-go/internal/models"
@@ -109,17 +110,60 @@ func parseData(entry *ct.RawLogEntry, operatorName, logName, ctURL, logType stri
 	return data, nil
 }
 
+// chainLeafCache memoizes parsed chain certificates keyed by their DER bytes.
+// A small set of active issuer certs covers virtually every CT log entry, so
+// this avoids re-parsing and re-hashing the same intermediates for every entry.
+// Cached LeafCerts are shared by reference and must be treated as immutable.
+var chainLeafCache = struct {
+	sync.Mutex
+	m map[string]models.LeafCert
+}{m: make(map[string]models.LeafCert)}
+
+// chainLeafCacheMax bounds the cache size. On overflow the map is reset
+// wholesale - issuer rotation is rare, so an occasional clear is cheaper than
+// LRU bookkeeping.
+const chainLeafCacheMax = 4096
+
+// leafCertFromDER returns the LeafCert for the given DER-encoded certificate,
+// serving repeated certs from chainLeafCache instead of re-parsing them.
+func leafCertFromDER(der []byte) (models.LeafCert, error) {
+	key := string(der)
+
+	chainLeafCache.Lock()
+	leaf, ok := chainLeafCache.m[key]
+	chainLeafCache.Unlock()
+
+	if ok {
+		return leaf, nil
+	}
+
+	myCert, parseErr := x509.ParseCertificate(der)
+	if parseErr != nil || myCert == nil {
+		return models.LeafCert{}, fmt.Errorf("could not parse certificate: %w", parseErr)
+	}
+
+	leaf = leafCertFromX509cert(*myCert, true, myCert.Raw)
+
+	chainLeafCache.Lock()
+	if len(chainLeafCache.m) >= chainLeafCacheMax {
+		clear(chainLeafCache.m)
+	}
+	chainLeafCache.m[key] = leaf
+	chainLeafCache.Unlock()
+
+	return leaf, nil
+}
+
 // parseCertificateChain returns the certificate chain in form of a []LeafCert from the given *ct.LogEntry.
 func parseCertificateChain(logEntry *ct.LogEntry) ([]models.LeafCert, error) {
 	chain := make([]models.LeafCert, len(logEntry.Chain))
 
 	for i, chainEntry := range logEntry.Chain {
-		myCert, parseErr := x509.ParseCertificate(chainEntry.Data)
-		if parseErr != nil || myCert == nil {
-			return nil, fmt.Errorf("could not parse certificate: %w", parseErr)
+		leafCert, err := leafCertFromDER(chainEntry.Data)
+		if err != nil {
+			return nil, err
 		}
 
-		leafCert := leafCertFromX509cert(*myCert, true, myCert.Raw)
 		chain[i] = leafCert
 	}
 

@@ -120,7 +120,10 @@ func (bm *Dispatcher) GetSkippedCerts() map[string]uint64 {
 func (bm *Dispatcher) broadcaster() {
 	for {
 		// Take entry out of broadcast channel.
-		entry := <-bm.MessageQueue
+		entry, ok := <-bm.MessageQueue
+		if !ok {
+			return
+		}
 
 		bm.clientLock.RLock()
 

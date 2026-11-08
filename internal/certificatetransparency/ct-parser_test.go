@@ -101,7 +101,7 @@ func makeX509RawLogEntry(der []byte, index int64) *ct.RawLogEntry {
 }
 
 // extractTBS returns the DER of the tbsCertificate inside a Certificate.
-func extractTBS(t *testing.T, certDER []byte) []byte {
+func extractTBS(t testing.TB, certDER []byte) []byte {
 	t.Helper()
 
 	var certRaw asn1.RawValue
@@ -119,7 +119,7 @@ func extractTBS(t *testing.T, certDER []byte) []byte {
 
 // makePrecertRawLogEntry builds a precert RawLogEntry: the leaf carries the
 // TBSCertificate, while Cert carries the submitted precert DER.
-func makePrecertRawLogEntry(t *testing.T, precertDER []byte, index int64) *ct.RawLogEntry {
+func makePrecertRawLogEntry(t testing.TB, precertDER []byte, index int64) *ct.RawLogEntry {
 	t.Helper()
 
 	tbsDER := extractTBS(t, precertDER)

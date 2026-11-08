@@ -33,7 +33,6 @@ type TileLeaf struct {
 	EntryType     uint16
 	X509Entry     []byte // For X.509 certificates
 	PrecertEntry  []byte // For precertificates
-	Chain         [][]byte
 	IssuerKeyHash [32]byte
 }
 
@@ -121,8 +120,12 @@ func FetchCheckpoint(ctx context.Context, client *http.Client, baseURL string) (
 }
 
 // ParseTileData parses the binary tile data into TileLeaf entries using cryptobyte.
+// The returned X509Entry/PrecertEntry slices alias the input buffer - callers
+// must not mutate data while the leaves are in use.
 func ParseTileData(data []byte) ([]TileLeaf, error) {
-	var leaves []TileLeaf
+	// A leaf is at least ~17 bytes on the wire - good enough to presize leaves
+	// without overshooting much on partial tiles.
+	leaves := make([]TileLeaf, 0, min(len(data)/16, TileSize))
 	parser := cryptobyte.String(data)
 
 	for !parser.Empty() {
@@ -143,16 +146,7 @@ func ParseTileData(data []byte) ([]TileLeaf, error) {
 				return nil, fmt.Errorf("x509_entry: %w", ErrInvalidDataTile)
 			}
 
-			leaf.X509Entry = append([]byte(nil), cert...)
-
-			for !fingerprints.Empty() {
-				var fp [32]byte
-				if !fingerprints.CopyBytes(fp[:]) {
-					return nil, ErrInvalidFingerprint
-				}
-
-				leaf.Chain = append(leaf.Chain, fp[:])
-			}
+			leaf.X509Entry = []byte(cert)
 
 		case 1: // precert_entry
 			var issuerKeyHash [32]byte
@@ -166,17 +160,8 @@ func ParseTileData(data []byte) ([]TileLeaf, error) {
 				return nil, fmt.Errorf("precert_entry: %w", ErrInvalidDataTile)
 			}
 
-			leaf.PrecertEntry = append([]byte(nil), defangedCrt...)
+			leaf.PrecertEntry = []byte(defangedCrt)
 			leaf.IssuerKeyHash = issuerKeyHash
-
-			for !fingerprints.Empty() {
-				var fp [32]byte
-				if !fingerprints.CopyBytes(fp[:]) {
-					return nil, ErrInvalidFingerprint
-				}
-
-				leaf.Chain = append(leaf.Chain, fp[:])
-			}
 
 		default:
 			return nil, fmt.Errorf("%w: %d", ErrUnknownEntryType, leaf.EntryType)
