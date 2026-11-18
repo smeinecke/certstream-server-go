@@ -123,6 +123,29 @@ func TestNamesQueryPublicSuffixPrefilter(t *testing.T) {
 	}
 }
 
+func TestHlTermsAndText(t *testing.T) {
+	// wildcard fragments become highlight terms
+	p := parseQuery("*foo*bar*")
+	if terms := hlTerms(p); len(terms) != 2 || terms[0] != "foo" || terms[1] != "bar" {
+		t.Fatalf("terms = %v", terms)
+	}
+	// plain domain highlights itself
+	p = parseQuery("github.com")
+	if terms := hlTerms(p); len(terms) == 0 || terms[0] != "github.com" {
+		t.Fatalf("terms = %v", terms)
+	}
+	// fingerprint queries produce no name highlights
+	p = parseQuery("fp:abc")
+	if terms := hlTerms(p); len(terms) != 0 {
+		t.Fatalf("terms = %v", terms)
+	}
+	// escaping is kept, matches are case-insensitive and marked
+	out := string(hlText("x<FOO.bar", []string{"foo."}))
+	if out != "x&lt;<mark>FOO.</mark>bar" {
+		t.Fatalf("out = %q", out)
+	}
+}
+
 func TestParseQuerySuffixCoversApex(t *testing.T) {
 	// %.github.com keeps the certs-side predicate for phase-2 row
 	// suppression AND gains the certs_dom range for phase-1.

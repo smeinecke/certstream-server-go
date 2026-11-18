@@ -55,6 +55,7 @@ type row struct {
 	Serial      string
 	O           string
 	Hostnames   string
+	Hl          []string // literal fragments to <mark> in Hostnames/CN
 	Fingerprint string
 	CertLink    string
 	AKI         string
@@ -109,6 +110,82 @@ func likeEsc(s string) string {
 	s = strings.ReplaceAll(s, `%`, `\%`)
 	s = strings.ReplaceAll(s, `_`, `\_`)
 	return s
+}
+
+// hlTerms extracts the literal fragments of a name-pattern predicate for
+// display highlighting - the text between %/* wildcards, un-escaped.
+// Only name-ish kinds produce terms: fingerprint/serial/idx hits would
+// mark unrelated columns. Reversed certs_dom args never match display
+// text and are harmless leftovers in the list.
+func hlTerms(pq parsed) []string {
+	switch pq.kind {
+	case "name substring", "name suffix", "name pattern",
+		"domain + subdomains", "subdomain names", "TLD suffix",
+		"root domain", "distinct names":
+	default:
+		return nil
+	}
+	var terms []string
+	seen := map[string]bool{}
+	for _, a := range pq.args {
+		s, ok := a.(string)
+		if !ok {
+			continue
+		}
+		s = strings.ReplaceAll(s, `\\`, "\x00")
+		s = strings.ReplaceAll(s, `\%`, "\x01")
+		for _, frag := range strings.FieldsFunc(s,
+			func(r rune) bool { return r == '%' || r == '*' }) {
+			frag = strings.Trim(frag, ". ")
+			frag = strings.ReplaceAll(frag, "\x00", `\`)
+			frag = strings.ReplaceAll(frag, "\x01", "%")
+			if len(frag) >= 2 && !seen[frag] {
+				seen[frag] = true
+				terms = append(terms, frag)
+			}
+		}
+	}
+	return terms
+}
+
+// hlText escapes s and wraps every case-insensitive occurrence of any
+// term in <mark>. Overlapping ranges merge into one mark.
+func hlText(s string, terms []string) template.HTML {
+	if len(terms) == 0 || s == "" {
+		return template.HTML(template.HTMLEscapeString(s))
+	}
+	low := strings.ToLower(s)
+	marks := make([]bool, len(s))
+	for _, t := range terms {
+		tl := strings.ToLower(t)
+		for off := 0; off+len(tl) <= len(low); {
+			i := strings.Index(low[off:], tl)
+			if i < 0 {
+				break
+			}
+			for j := off + i; j < off+i+len(tl); j++ {
+				marks[j] = true
+			}
+			off += i + len(tl)
+		}
+	}
+	var sb strings.Builder
+	for i := 0; i < len(s); {
+		marked := marks[i]
+		if marked {
+			sb.WriteString("<mark>")
+		}
+		j := i
+		for j < len(s) && marks[j] == marked {
+			j++
+		}
+		sb.WriteString(template.HTMLEscapeString(s[i:j]))
+		if marked {
+			sb.WriteString("</mark>")
+		}
+		i = j
+	}
+	return template.HTML(sb.String())
 }
 
 // parseQuery maps crt.sh-style queries onto the certs schema:
@@ -377,6 +454,7 @@ tr:nth-child(even){background:#f4f4f4}
 a{color:#005}
 .err{color:#a00}
 .hint{color:#666}
+mark{background:#ffe066;padding:0 1px}
 td.idx{white-space:nowrap}
 #ld{margin:1em 0;padding:.5em .8em;background:#ffc;border:1px solid #cc6}
 .spin{display:inline-block;width:12px;height:12px;border:2px solid #999;
@@ -425,13 +503,13 @@ return false}
 </script>`))
 
 var rowTpl = template.Must(template.New("row").Funcs(
-	template.FuncMap{"ts": tsFormat}).Parse(`<tr>
+	template.FuncMap{"ts": tsFormat, "hl": hlText}).Parse(`<tr>
 <td class="idx"><a href="cert/{{.Index}}">{{.Index}}</a></td>
 <td>{{.Seen.Format "2006-01-02"}}</td>
 <td>{{ts .NotBefore}}</td>
 <td>{{ts .NotAfter}}</td>
-<td>{{.CN}}</td>
-<td>{{.Hostnames}}</td>
+<td>{{hl .CN .Hl}}</td>
+<td>{{hl .Hostnames .Hl}}</td>
 <td>{{.Serial}}</td>
 <td>{{.O}}</td>
 </tr>
@@ -444,11 +522,13 @@ type nameRow struct {
 	Domain  string
 	Index   uint64
 	Count   uint64
-	Example string // dedup mode: one folded name behind this eTLD+1
+	Example string   // dedup mode: one folded name behind this eTLD+1
+	Hl      []string // literal fragments to <mark> in Domain/Example
 }
 
-var nameRowTpl = template.Must(template.New("nrow").Parse(`<tr>
-<td>{{.Domain}}{{if .Example}} <span class="hint">(e.g. {{.Example}})</span>{{end}}</td>
+var nameRowTpl = template.Must(template.New("nrow").Funcs(
+	template.FuncMap{"hl": hlText}).Parse(`<tr>
+<td>{{hl .Domain .Hl}}{{if .Example}} <span class="hint">(e.g. {{hl .Example .Hl}})</span>{{end}}</td>
 <td class="idx"><a href="cert/{{.Index}}">{{.Index}}</a></td>
 <td>{{.Count}}</td>
 </tr>`))
@@ -572,6 +652,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, dedup bool,
 	emitRow func(row), emitName func(nameRow), emitStatus func(string)) (qErr string, count int, haveNext bool, lastIdx uint64, lastDom string) {
 
+	terms := hlTerms(pq)
 	var lastSt time.Time
 	status := func(s string) {
 		// throttle to one update per 2s - scans emit no rows, so these
@@ -638,6 +719,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 			if v.Example == v.Domain {
 				v.Example = "" // apex matched - nothing hidden to show
 			}
+			v.Hl = terms
 			lastDom = v.Domain
 			emitName(v)
 			count++
@@ -684,6 +766,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 				lastIdx, lastDom = rw.Index, rw.Domain
 			}
 			rw.Hostnames = shortNames(rw.Hostnames, 200)
+			rw.Hl = terms
 			emitRow(rw)
 			count++
 		}
