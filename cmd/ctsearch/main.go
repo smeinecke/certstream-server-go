@@ -593,23 +593,23 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 	if pq.names {
 		// distinct-name aggregation on certs - domain is its leading PK,
 		// so exact/prefix filters seek and GROUP BY domain aggregates in
-		// order (rows stream out progressively). Pages are alphabetical;
-		// afterd carries the domain cursor.
+		// order (rows stream out progressively). No LIMIT: GROUP BY
+		// materializes the full match set regardless, so paging saved no
+		// server work - return everything and let it stream. afterd is
+		// still honoured as a manual domain > cursor for old links.
 		nwhere := "(" + pq.where + ")"
 		nargs := append([]any{}, pq.args...)
 		if afterd != "" {
 			nwhere += " AND domain > ?"
 			nargs = append(nargs, afterd)
 		}
-		nargs = append(nargs, *flagLimit+1)
 		status("aggregating distinct names")
 		nr, err := chConn.Query(qctx,
 			`SELECT domain, max(cert_index) AS mi, count() AS c
 			 FROM `+flagDBOr()+`.`+flagTableOr()+`
 			 WHERE `+nwhere+`
 			 GROUP BY domain
-			 ORDER BY domain ASC
-			 LIMIT ?`, nargs...)
+			 ORDER BY domain ASC`, nargs...)
 		if err != nil {
 			qErr = err.Error()
 			return
@@ -620,10 +620,6 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 			if err := nr.Scan(&v.Domain, &v.Index, &v.Count); err != nil {
 				qErr = "scan: " + err.Error()
 				return
-			}
-			if count == *flagLimit {
-				haveNext = true
-				continue
 			}
 			lastDom = v.Domain
 			emitName(v)

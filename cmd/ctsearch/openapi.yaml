@@ -48,7 +48,8 @@ paths:
       summary: Search certificates
       description: |
         Executes a query and streams up to `-limit` rows (default 100)
-        plus one lookahead row that only signals page availability.
+        plus one lookahead row that only signals page availability -
+        `names:` queries are exempt and stream the full result set.
 
         **Response format is content-negotiated via `Accept`:**
 
@@ -76,13 +77,18 @@ paths:
         | `cn:<name>` | subject CN exact | `i_cn` bloom - slow |
         | `idx:<n>`, bare integer | cert_index | `certs_idx` + domain PK seeks |
 
-        **Pagination.** When a result set exceeds the page limit the
-        footer (`end` event / page footer) links `after=<cert_index>`
-        and `afterd=<domain>` cursor params plus `page=<n+1>`. `after`
-        is a cert_index lower bound; `afterd` is the domain cursor used
-        by `names:` pages and as a row-level tiebreak for single-phase
-        queries. Cursors are forward-only - the UI keeps a page->cursor
-        stack for "prev".
+        **Pagination.** Row searches return at most `-limit` rows; when
+        more exist the footer (`end` event / page footer) links
+        `after=<cert_index>` and `afterd=<domain>` cursor params plus
+        `page=<n+1>`. `after` is a cert_index lower bound; `afterd` is
+        the domain cursor (also a row-level tiebreak for single-phase
+        queries). Cursors are forward-only - the UI keeps a
+        page->cursor stack for "prev".
+
+        `names:` queries are NOT paginated - the GROUP BY already
+        materializes the full match set, so every distinct name is
+        streamed in one response (`afterd` is still honoured as a
+        manual `domain >` filter if passed).
 
         **Timing.** A server-side `-query-timeout` (default 285s) bounds
         each query; a proxy read timeout above that is required for slow
@@ -111,9 +117,9 @@ paths:
           in: query
           required: false
           description: >
-            Domain cursor. For `names:` queries it is the strict
-            alphabetical continuation (`domain > afterd`). For
-            single-phase queries it pairs with `after` as a
+            Domain cursor. For `names:` queries it acts as a manual
+            `domain > afterd` filter (no pagination links are emitted).
+            For single-phase queries it pairs with `after` as a
             `(cert_index, domain)` tuple cursor so sibling SAN rows at
             a page boundary are not dropped.
           schema: { type: string }
