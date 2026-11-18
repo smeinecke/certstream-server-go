@@ -239,13 +239,15 @@ func parseQuery(q string) parsed {
 	if strings.HasPrefix(q, "%.") || strings.HasPrefix(q, "*.") {
 		suffix := strings.TrimPrefix(strings.TrimPrefix(q, "%."), "*.")
 		if !strings.Contains(suffix, ".") {
-			// bare TLD (%.de) - 'de' is a public suffix, never an eTLD+1, so
-			// root_domain can't help; tld='de' covers it on the main table.
-			// Phase-1 scans certs_idx's narrow domain column instead.
+			// bare TLD (%.de) - 'de' is a public suffix, never an eTLD+1,
+			// so root_domain can't help. The tld column is mixed-convention
+			// (old rows store the full public suffix, e.g. 'co.uk'), so
+			// match endsWith(domain, '.de') directly - it also covers
+			// multi-label suffixes like x.co.uk that tld='uk' would miss.
 			sfx := "." + strings.ToLower(suffix)
 			return parsed{
-				`tld = ?`, []any{strings.ToLower(suffix)}, "TLD suffix", false, false,
-				`endsWith(domain, ?)`, []any{sfx},
+				`endsWith(domain, ?)`, []any{sfx}, "TLD suffix", false, false,
+				"", nil,
 				`startsWith(domain_rev, ?)`, []any{revStr(sfx)},
 				`endsWith(domain, ?)`, []any{sfx},
 			}
