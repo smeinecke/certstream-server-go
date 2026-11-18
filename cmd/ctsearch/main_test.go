@@ -101,6 +101,28 @@ func TestParseQueryDomainKeyword(t *testing.T) {
 	}
 }
 
+func TestNamesQueryPublicSuffixPrefilter(t *testing.T) {
+	// names:%.x.github.io - github.io is a public suffix, so the
+	// root_domain prefilter must be the eTLD+1 (x.github.io), not the
+	// last two labels (github.io can never be a root_domain).
+	p := parseQuery("names:%.x.github.io")
+	want := `root_domain = ? AND (domain = ? OR endsWith(domain, ?))`
+	if p.where != want {
+		t.Fatalf("where = %q", p.where)
+	}
+	if p.args[0] != "x.github.io" || p.args[1] != "x.github.io" || p.args[2] != ".x.github.io" {
+		t.Fatalf("args = %v", p.args)
+	}
+
+	// names:%.github.io - the suffix IS a public suffix: no eTLD+1
+	// exists, so no root_domain prefilter is possible (scan instead of
+	// the wrong empty result lastTwoLabels produced before).
+	p = parseQuery("names:%.github.io")
+	if want := `domain = ? OR endsWith(domain, ?)`; p.where != want {
+		t.Fatalf("where = %q, want %q", p.where, want)
+	}
+}
+
 func TestParseQuerySuffixCoversApex(t *testing.T) {
 	// %.github.com keeps the certs-side predicate for phase-2 row
 	// suppression AND gains the certs_dom range for phase-1.

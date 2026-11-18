@@ -264,17 +264,17 @@ func namesQuery(sub string) parsed {
 		return parsed{w, args, "distinct names", false, true, "", nil, "", nil, "", nil}
 	}
 	suffixPred := func(sfx string) parsed {
-		// labels(sfx)>=2: root_domain=last2 prunes granules, then
-		// domain/domain_rev finishes the job. When sfx itself is 2
-		// labels, root_domain alone is already equivalent.
-		if n := strings.Count(sfx, "."); n >= 2 {
-			l2 := lastTwoLabels(sfx)
+		// root_domain prefilter = eTLD+1 of the suffix: every name equal
+		// to or under sfx shares that registrable domain. lastTwoLabels
+		// was wrong whenever the last two labels are themselves a public
+		// suffix (github.io, co.uk) - those can never be a root_domain,
+		// so EffectiveTLDPlusOne is authoritative. Errors (sfx IS a
+		// public suffix, or a bare TLD like 'de') mean no prefilter
+		// exists and the domain column is scanned as-is.
+		if e1, err := publicsuffix.EffectiveTLDPlusOne(sfx); err == nil {
 			return mk(`root_domain = ? AND (domain = ? OR endsWith(domain, ?))`,
-				l2, sfx, "."+sfx)
-		} else if n == 1 {
-			return mk(`root_domain = ?`, sfx)
+				e1, sfx, "."+sfx)
 		}
-		// single-label suffix (%.de) - no root_domain value possible
 		return mk(`domain = ? OR endsWith(domain, ?)`, sfx, "."+sfx)
 	}
 	switch {
@@ -299,16 +299,6 @@ func namesQuery(sub string) parsed {
 	default:
 		return suffixPred(s)
 	}
-}
-
-// lastTwoLabels returns the final two dot-separated labels of s.
-func lastTwoLabels(s string) string {
-	if i := strings.LastIndex(s, "."); i > 0 {
-		if j := strings.LastIndex(s[:i], "."); j >= 0 {
-			return s[j+1:]
-		}
-	}
-	return s
 }
 
 // domScope builds the certs_dom predicate covering apex and all
@@ -399,6 +389,7 @@ vertical-align:-2px;margin-right:.4em}
 <form method="get" action="search">
 <input type="text" name="q" value="{{.Query}}" autofocus placeholder="%.example.com | example.com | fp: | serial: | cn: | idx:">
 <input type="submit" value="Search">
+<label title="names: only - fold results to registrable domains"><input type="checkbox" name="dedup" value="1"{{if .Dedup}} checked{{end}}> domains only</label>
 </form>
 <p class="hint">
 %.example.com = subdomains &nbsp;&middot;&nbsp; example.com = name + subdomains &nbsp;&middot;&nbsp;
@@ -450,13 +441,14 @@ var rowTpl = template.Must(template.New("row").Funcs(
 // newest cert_index carrying it (linked to the cert page) and how many
 // SAN rows that name appears in.
 type nameRow struct {
-	Domain string
-	Index  uint64
-	Count  uint64
+	Domain  string
+	Index   uint64
+	Count   uint64
+	Example string // dedup mode: one folded name behind this eTLD+1
 }
 
 var nameRowTpl = template.Must(template.New("nrow").Parse(`<tr>
-<td>{{.Domain}}</td>
+<td>{{.Domain}}{{if .Example}} <span class="hint">(e.g. {{.Example}})</span>{{end}}</td>
 <td class="idx"><a href="cert/{{.Index}}">{{.Index}}</a></td>
 <td>{{.Count}}</td>
 </tr>`))
@@ -577,7 +569,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 // runSearch executes the parsed query and calls emitRow per display
 // row; emitStatus (may be nil) reports phase progress for streamed UIs.
 // Returns the error text, row count, and pagination cursor.
-func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
+func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, dedup bool,
 	emitRow func(row), emitName func(nameRow), emitStatus func(string)) (qErr string, count int, haveNext bool, lastIdx uint64, lastDom string) {
 
 	var lastSt time.Time
@@ -599,17 +591,33 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 		// still honoured as a manual domain > cursor for old links.
 		nwhere := "(" + pq.where + ")"
 		nargs := append([]any{}, pq.args...)
+		groupCol, cursorCol := "domain", "domain"
+		if dedup {
+			// fold every name to its eTLD+1: root_domain is already the
+			// registrable domain per row, so GROUP BY root_domain is the
+			// same dedup - just done in ClickHouse instead of Go.
+			groupCol, cursorCol = "root_domain", "root_domain"
+			nwhere += ` AND root_domain != ''`
+		}
 		if afterd != "" {
-			nwhere += " AND domain > ?"
+			nwhere += " AND " + cursorCol + " > ?"
 			nargs = append(nargs, afterd)
 		}
 		status("aggregating distinct names")
+		exCol := ""
+		if dedup {
+			// one example of the folded names - without it a match like
+			// names:*bla* would show only bla.com and hide which
+			// subdomain actually matched. argMax picks a name from the
+			// newest cert in the group, consistent with mi.
+			exCol = `, argMax(domain, cert_index) AS ex`
+		}
 		nr, err := chConn.Query(qctx,
-			`SELECT domain, max(cert_index) AS mi, count() AS c
+			`SELECT `+groupCol+` AS domain, max(cert_index) AS mi, count() AS c`+exCol+`
 			 FROM `+flagDBOr()+`.`+flagTableOr()+`
 			 WHERE `+nwhere+`
-			 GROUP BY domain
-			 ORDER BY domain ASC`, nargs...)
+			 GROUP BY `+groupCol+`
+			 ORDER BY `+groupCol+` ASC`, nargs...)
 		if err != nil {
 			qErr = err.Error()
 			return
@@ -617,9 +625,18 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 		defer nr.Close()
 		for nr.Next() {
 			var v nameRow
-			if err := nr.Scan(&v.Domain, &v.Index, &v.Count); err != nil {
+			var err error
+			if dedup {
+				err = nr.Scan(&v.Domain, &v.Index, &v.Count, &v.Example)
+			} else {
+				err = nr.Scan(&v.Domain, &v.Index, &v.Count)
+			}
+			if err != nil {
 				qErr = "scan: " + err.Error()
 				return
+			}
+			if v.Example == v.Domain {
+				v.Example = "" // apex matched - nothing hidden to show
 			}
 			lastDom = v.Domain
 			emitName(v)
@@ -814,7 +831,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string,
 }
 
 // searchArgs pulls the query params shared by all response modes.
-func searchArgs(r *http.Request) (q string, after uint64, afterd string, page int, pq parsed) {
+func searchArgs(r *http.Request) (q string, after uint64, afterd string, page int, pq parsed, dedup bool) {
 	q = r.URL.Query().Get("q")
 	after, _ = strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
 	afterd = r.URL.Query().Get("afterd")
@@ -823,6 +840,10 @@ func searchArgs(r *http.Request) (q string, after uint64, afterd string, page in
 		page = 1
 	}
 	pq = parseQuery(q)
+	switch r.URL.Query().Get("dedup") {
+	case "1", "true", "on":
+		dedup = true
+	}
 	return
 }
 
@@ -845,9 +866,9 @@ type footData struct {
 // this survives response-buffering proxies such as Cloudflare, which
 // would otherwise hold the whole page until the query finishes.
 func searchShell(w http.ResponseWriter, r *http.Request) {
-	q, _, _, _, pq := searchArgs(r)
+	q, _, _, _, pq, dedup := searchArgs(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	headTpl.Execute(w, struct{ Query, Base string }{q, base})
+	headTpl.Execute(w, struct{ Query, Base string; Dedup bool }{q, base, dedup})
 	if q == "" {
 		io.WriteString(w, "</body></html>")
 		return
@@ -887,7 +908,7 @@ func searchShell(w http.ResponseWriter, r *http.Request) {
 // plus a final `end` (footer html) or `err` event. Heartbeat comments
 // keep the connection alive through proxies during long scans.
 func searchSSE(w http.ResponseWriter, r *http.Request) {
-	q, after, afterd, page, pq := searchArgs(r)
+	q, after, afterd, page, pq, dedup := searchArgs(r)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -913,7 +934,7 @@ func searchSSE(w http.ResponseWriter, r *http.Request) {
 	defer hb.Stop()
 
 	start := time.Now()
-	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd,
+	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd, dedup,
 		func(rw row) { sse.send("row", tplStr(rowTpl, rw)) },
 		func(nr nameRow) { sse.send("row", tplStr(nameRowTpl, nr)) },
 		func(s string) { sse.send("status", s) })
@@ -929,10 +950,10 @@ func searchSSE(w http.ResponseWriter, r *http.Request) {
 // searchInline streams the plain-HTML page as before - for curl and
 // other non-browser clients that cannot consume SSE.
 func searchInline(w http.ResponseWriter, r *http.Request) {
-	q, after, afterd, page, pq := searchArgs(r)
+	q, after, afterd, page, pq, dedup := searchArgs(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Accel-Buffering", "no") // let rows trickle through nginx
-	headTpl.Execute(w, struct{ Query, Base string }{q, base})
+	headTpl.Execute(w, struct{ Query, Base string; Dedup bool }{q, base, dedup})
 	if q == "" {
 		io.WriteString(w, "</body></html>")
 		return
@@ -954,7 +975,7 @@ func searchInline(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	var n int
-	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd,
+	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd, dedup,
 		func(rw row) {
 			rowTpl.Execute(w, rw)
 			if n++; fl != nil && n%16 == 0 {
@@ -995,7 +1016,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	headTpl.Execute(w, struct{ Query, Base string }{"", base})
+	headTpl.Execute(w, struct{ Query, Base string; Dedup bool }{"", base, false})
 	io.WriteString(w, "</body></html>")
 }
 

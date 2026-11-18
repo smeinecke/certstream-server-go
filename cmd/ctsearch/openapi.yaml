@@ -72,6 +72,7 @@ paths:
         | `foo%`, `foo*.com` | pattern with literal prefix | domain PK range scan |
         | `domain:x` | literal `root_domain` field match (eTLD+1) | `certs_dom` when x is a valid eTLD+1, else `i_rd` bloom fallback |
         | `names:<filter>` | distinct names + latest cert_index + row count | `GROUP BY domain` on certs |
+        | `names:<filter>` + `dedup=1` | folded to registrable domains (eTLD+1) | `GROUP BY root_domain` on certs |
         | `fp:<hex>`, `fingerprint:<hex>`, bare 64-hex | SHA-256 fingerprint | `i_fp` bloom - slow |
         | `serial:<n>` | serial number | `i_sn` bloom - slow |
         | `cn:<name>` | subject CN exact | `i_cn` bloom - slow |
@@ -128,6 +129,16 @@ paths:
           required: false
           description: Displayed page number (footer/prev-stack bookkeeping only)
           schema: { type: integer, minimum: 1, default: 1 }
+        - name: dedup
+          in: query
+          required: false
+          description: >
+            `names:` only - fold results to registrable domains
+            (eTLD+1) via `GROUP BY root_domain`. Each row still carries
+            one `example` name from the newest cert in the group, so a
+            pattern match like `names:*bla*` remains explainable.
+            Accepted values: `1`, `true`, `on`.
+          schema: { type: string, enum: ["1", "true", "on"] }
       responses:
         "200":
           description: |
@@ -240,6 +251,7 @@ components:
         domain:    { type: string }
         cert_index: { type: integer, format: uint64, description: newest cert carrying the name }
         count:      { type: integer, format: uint64, description: SAN rows containing the name }
+        example:    { type: string, description: "dedup only: one folded name from the newest cert in the group (argMax(domain, cert_index)); empty when it equals domain" }
     SSEEvents:
       type: object
       description: |
