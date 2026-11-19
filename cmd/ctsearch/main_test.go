@@ -136,6 +136,48 @@ func TestParseQueryIssuer(t *testing.T) {
 	}
 }
 
+func TestNormKeyIDAndParse(t *testing.T) {
+	cases := map[string]string{
+		"90:77:92:35":       "keyid:90:77:92:35",
+		"keyid:90:77:92:35": "keyid:90:77:92:35",
+		"90779235":          "keyid:90:77:92:35",
+		"KEYID:90:77:92:35": "keyid:90:77:92:35",
+		"90-77-92-35":       "keyid:90:77:92:35",
+		"90 77 92 35":       "keyid:90:77:92:35",
+		"":                  "",
+		"zz":                "",
+		"907":               "", // odd hex count
+	}
+	for in, want := range cases {
+		if got := normKeyID(in); got != want {
+			t.Fatalf("normKeyID(%q) = %q, want %q", in, got, want)
+		}
+	}
+	p := parseQuery("aki:90779235")
+	if p.kind != "authority key id" || p.args[0] != "keyid:90:77:92:35" {
+		t.Fatalf("aki parse = %+v", p)
+	}
+	p = parseQuery("ski:keyid:90779235")
+	if p.kind != "subject key id" || p.args[0] != "keyid:90:77:92:35" {
+		t.Fatalf("ski parse = %+v", p)
+	}
+	if p := parseQuery("aki:not-hex-ok"); p.where != `1 = 0` {
+		t.Fatalf("invalid aki should match nothing, got %q", p.where)
+	}
+}
+
+func TestIssuerCN(t *testing.T) {
+	if got := issuerCN("/C=US/O=Let's Encrypt/CN=R11"); got != "R11" {
+		t.Fatalf("got %q", got)
+	}
+	if got := issuerCN("/C=US/OU=ca.example"); got != "OU=ca.example" {
+		t.Fatalf("no-CN fallback got %q", got)
+	}
+	if got := issuerCN(""); got != "" {
+		t.Fatalf("empty got %q", got)
+	}
+}
+
 func TestHlTermsAndText(t *testing.T) {
 	// wildcard fragments become highlight terms
 	p := parseQuery("*foo*bar*")

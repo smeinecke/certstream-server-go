@@ -90,6 +90,8 @@ paths:
         | `cn:<name>` | subject CN exact | `i_cn` bloom - slow |
         | `idx:<n>`, bare integer | cert_index | `certs_idx` + domain PK seeks |
         | `issuer:<ca>` | case-insensitive substring on the issuer DN (`/C=US/O=.../CN=...`) | `issuer` column scan - rows without a recorded issuer (pre-column, CA never logged) are unreachable |
+        | `aki:<hex>` | authority_key_identifier exact match - the signing CA's key id | `authority_key_identifier` column scan - input is normalized to `keyid:aa:bb:` form, so `aki:90:77:92:...`, `aki:907792...` and `aki:keyid:90:77:92:...` are equivalent |
+        | `ski:<hex>` | subject_key_identifier exact match - the cert's own key id | `subject_key_identifier` column scan - same normalization as `aki:` |
 
         **Pagination.** Row searches return at most `-limit` rows; when
         more exist the footer (`end` event / page footer) links
@@ -259,6 +261,64 @@ paths:
             text/html:
               schema: { type: string }
 
+  /ca:
+    get:
+      tags: [search]
+      summary: CA issuers report (crt.sh ca-issuers analog)
+      description: >
+        Every issuer DN observed on leaf certs, sorted by leaf count,
+        joined with the fetched issuer-certificate directory
+        (`certstream.issuers`) for AKI and AIA caIssuers URL. Counts are
+        precomputed into `certstream.issuer_stats` - the endpoint itself
+        is a tiny-table join, not a live GROUP BY. Issuer names link
+        into `search?q=issuer:<cn>` and AKI cells into `search?q=aki:<hex>`.
+        `?output=json` or `Accept: application/json` returns the rows
+        as a JSON array.
+      parameters:
+        - name: output
+          in: query
+          required: false
+          description: "`json` returns a JSON array instead of HTML"
+          schema: { type: string, enum: ["json"] }
+      responses:
+        "200":
+          description: Issuer report - HTML table or JSON array
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CaIssuer" }
+
+  /stats:
+    get:
+      tags: [search]
+      summary: Dataset summary
+      description: >
+        One-shot statistics built from cheap queries only: total cert
+        count, on-disk size and part count from `system.parts`, the
+        freshest cert_index from `certs_idx`, the newest row's insert
+        timestamp, an ingest-rate estimate derived from the wall-clock
+        span of the newest 5M cert_index values, and issuer coverage
+        totals from `certstream.issuer_stats` (refreshed by a manual
+        GROUP BY, not live). `?output=json` or a JSON Accept header
+        returns the object below.
+      parameters:
+        - name: output
+          in: query
+          required: false
+          description: "`json` returns JSON instead of HTML"
+          schema: { type: string, enum: ["json"] }
+      responses:
+        "200":
+          description: Dataset statistics - HTML table or JSON object
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: "#/components/schemas/Stats" }
+
   /openapi.yaml:
     get:
       tags: [ui]
@@ -296,6 +356,30 @@ components:
         cert_index: { type: integer, format: uint64, description: newest cert carrying the name }
         count:      { type: integer, format: uint64, description: SAN rows containing the name }
         example:    { type: string, description: "dedup only: one folded name from the newest cert in the group (argMax(domain, cert_index)); empty when it equals domain" }
+    CaIssuer:
+      type: object
+      description: One row of the /ca report.
+      properties:
+        issuer:     { type: string, description: issuer DN `/C=../O=../CN=..` }
+        aki:        { type: string, description: "authority key id `keyid:aa:bb:..`, empty when the issuer cert was never fetched" }
+        aia_url:    { type: string, description: AIA caIssuers URL the issuer cert came from }
+        leafs:      { type: integer, format: uint64, description: certs carrying this issuer DN }
+        first_seen: { type: string, format: date-time }
+        last_seen:  { type: string, format: date-time }
+    Stats:
+      type: object
+      description: /stats response.
+      properties:
+        total_certs:         { type: integer, format: uint64 }
+        storage_bytes:       { type: integer, format: uint64 }
+        active_parts:        { type: integer, format: uint64 }
+        max_cert_index:      { type: integer, format: uint64 }
+        last_seen:           { type: string, format: date-time }
+        ingest_rows_per_min: { type: number, description: estimate from the newest 5M cert_index delta }
+        issuer_dns:          { type: integer, format: uint64, description: distinct issuer DNs recorded }
+        issued_leafs:        { type: integer, format: uint64, description: certs with a non-empty issuer DN }
+        issuer_coverage:     { type: number, description: "issued_leafs / total_certs * 100" }
+        top_issuers:         { type: array, items: { $ref: "#/components/schemas/CaIssuer" } }
     SSEEvents:
       type: object
       description: |

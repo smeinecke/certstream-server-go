@@ -119,6 +119,37 @@ func likeEsc(s string) string {
 	return s
 }
 
+// normKeyID normalizes a key-identifier search term into the stored
+// "keyid:aa:bb:cc" form. Input may carry a "keyid:" prefix, colons,
+// dashes or spaces, or be bare hex; non-hex leftovers make it invalid.
+func normKeyID(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimPrefix(s, "keyid:")
+	var sb strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f':
+			sb.WriteRune(r)
+		case r == ':' || r == '-' || r == ' ':
+		default:
+			return ""
+		}
+	}
+	h := sb.String()
+	if len(h) == 0 || len(h)%2 != 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("keyid:")
+	for i := 0; i < len(h); i += 2 {
+		if i > 0 {
+			b.WriteByte(':')
+		}
+		b.WriteString(h[i : i+2])
+	}
+	return b.String()
+}
+
 // hlTerms extracts the literal fragments of a name-pattern predicate for
 // display highlighting - the text between %/* wildcards, un-escaped.
 // Only name-ish kinds produce terms: fingerprint/serial/idx hits would
@@ -245,6 +276,25 @@ func parseQuery(q string) parsed {
 		}
 		return parsed{`positionCaseInsensitive(issuer, ?) > 0`, []any{v},
 			"issuer", false, false, "", nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "aki:"):
+		// authority_key_identifier: the signing CA's key id. Accepts hex
+		// with or without "keyid:"/colons, normalized to the stored
+		// "keyid:aa:bb:.." form. Full scan - every cert carries an aki.
+		v := normKeyID(q[4:])
+		if v == "" {
+			return parsed{`1 = 0`, nil, "authority key id", true, false, "", nil, "", nil, "", nil}
+		}
+		return parsed{`authority_key_identifier = ?`, []any{v},
+			"authority key id", false, false, "", nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "ski:"):
+		// subject_key_identifier: this cert's own key id. Mostly unique per
+		// cert, but shared by reissued certs on the same key.
+		v := normKeyID(q[4:])
+		if v == "" {
+			return parsed{`1 = 0`, nil, "subject key id", true, false, "", nil, "", nil, "", nil}
+		}
+		return parsed{`subject_key_identifier = ?`, []any{v},
+			"subject key id", false, false, "", nil, "", nil, "", nil}
 	}
 
 	if n, err := strconv.ParseUint(q, 10, 64); err == nil {
@@ -494,7 +544,8 @@ vertical-align:-2px;margin-right:.4em}
 %.example.com = subdomains &nbsp;&middot;&nbsp; example.com = name + subdomains &nbsp;&middot;&nbsp;
 % and * wildcards anywhere (foo%, %brand%) &nbsp;&middot;&nbsp;
 names:&lt;filter&gt; = distinct names &nbsp;&middot;&nbsp; domain:&lt;d&gt; = root_domain field &nbsp;&middot;&nbsp; issuer:&lt;ca&gt; &nbsp;&middot;&nbsp;
-fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt; &middot; <a href="openapi.yaml">api</a>
+aki:/ski:&lt;hex&gt; = key ids &nbsp;&middot;&nbsp;
+fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt; &middot; <a href="ca">ca-issuers</a> &middot; <a href="stats">stats</a> &middot; <a href="openapi.yaml">api</a>
 </p>
 <script>
 // cursor stack for prev-page navigation - cursors are forward-only, so
@@ -524,8 +575,23 @@ location.href=v;
 return false}
 </script>`))
 
+// issuerCN shortens an issuer DN for table display: the CN= component
+// if present, else the last non-empty DN component.
+func issuerCN(dn string) string {
+	if dn == "" {
+		return ""
+	}
+	for _, seg := range strings.Split(dn, "/") {
+		if strings.HasPrefix(seg, "CN=") {
+			return seg[3:]
+		}
+	}
+	parts := strings.Split(strings.Trim(dn, "/"), "/")
+	return parts[len(parts)-1]
+}
+
 var rowTpl = template.Must(template.New("row").Funcs(
-	template.FuncMap{"ts": tsFormat, "hl": hlText}).Parse(`<tr>
+	template.FuncMap{"ts": tsFormat, "hl": hlText, "issuerCN": issuerCN}).Parse(`<tr>
 <td class="idx"><a href="cert/{{.Index}}">{{.Index}}</a></td>
 <td>{{.Seen.Format "2006-01-02"}}</td>
 <td>{{ts .NotBefore}}</td>
@@ -534,6 +600,7 @@ var rowTpl = template.Must(template.New("row").Funcs(
 <td>{{hl .Hostnames .Hl}}</td>
 <td>{{.Serial}}</td>
 <td>{{.O}}</td>
+<td class="hint">{{issuerCN .Issuer}}</td>
 </tr>
 `))
 
@@ -1015,7 +1082,7 @@ func searchShell(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, "<p>%s:</p>\n", template.HTMLEscapeString(pq.kind))
 	header := `<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>` +
-		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>"
+		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th><th>issuer</th></tr>"
 	if pq.names {
 		header = `<tr><th>name</th><th>latest cert_index</th><th>rows</th></tr>`
 	}
@@ -1102,7 +1169,7 @@ func searchInline(w http.ResponseWriter, r *http.Request) {
 	fl, _ := w.(http.Flusher)
 	fmt.Fprintf(w, "<p>%s:</p>\n", template.HTMLEscapeString(pq.kind))
 	header := `<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>` +
-		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th></tr>"
+		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th><th>issuer</th></tr>"
 	if pq.names {
 		header = `<tr><th>name</th><th>latest cert_index</th><th>rows</th></tr>`
 	}
@@ -1307,6 +1374,191 @@ func certHandler(w http.ResponseWriter, r *http.Request) {
 	certTpl.Execute(w, p)
 }
 
+// --- /ca and /stats ---------------------------------------------------------
+
+type caRow struct {
+	Name      string    `json:"issuer"`
+	AKI       string    `json:"aki,omitempty"`
+	URL       string    `json:"aia_url,omitempty"`
+	Leafs     uint64    `json:"leafs"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+// caHandler serves the ca-issuers report: every issuer DN seen on leaf
+// certs, enriched with AKI + AIA URL where the issuer cert was fetched.
+// Both source tables are tiny - the expensive GROUP BY already ran once
+// into certstream.issuer_stats.
+func caHandler(w http.ResponseWriter, r *http.Request) {
+	qctx, qcancel := context.WithTimeout(r.Context(), *flagQTimeout)
+	defer qcancel()
+	rows, err := chConn.Query(qctx,
+		`SELECT s.name, ifNull(i.aki, ''), ifNull(i.url, ''),
+		        s.leafs, s.first_seen, s.last_seen
+		 FROM `+flagDBOr()+`.issuer_stats s
+		 LEFT JOIN `+flagDBOr()+`.issuers i ON i.name = s.name
+		 ORDER BY s.leafs DESC`)
+	if err != nil {
+		http.Error(w, "query: "+err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+	var out []caRow
+	for rows.Next() {
+		var c caRow
+		if err := rows.Scan(&c.Name, &c.AKI, &c.URL, &c.Leafs, &c.FirstSeen, &c.LastSeen); err != nil {
+			http.Error(w, "scan: "+err.Error(), 500)
+			return
+		}
+		out = append(out, c)
+	}
+	if wantsJSON(r) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(out)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	headTpl.Execute(w, formData{Base: base})
+	io.WriteString(w, `<div class="tw"><table><tr><th>issuer</th><th>leafs</th><th>first seen</th><th>last seen</th><th>aki</th><th>aia url</th></tr>`)
+	for _, c := range out {
+		var b strings.Builder
+		b.WriteString("<tr><td><a href=\"search?q=issuer%3A" + url.QueryEscape(issuerCN(c.Name)) + "\">" +
+			template.HTMLEscapeString(c.Name) + "</a></td><td>" + fmt.Sprint(c.Leafs) + "</td><td>" +
+			c.FirstSeen.Format("2006-01-02") + "</td><td>" + c.LastSeen.Format("2006-01-02") + "</td><td>")
+		if c.AKI != "" {
+			b.WriteString(`<a href="search?q=aki%3A` + url.QueryEscape(c.AKI) + `">` + template.HTMLEscapeString(c.AKI[:min(30, len(c.AKI))]) + "&hellip;</a>")
+		}
+		b.WriteString("</td><td>")
+		if c.URL != "" {
+			u := template.HTMLEscapeString(c.URL)
+			b.WriteString(`<a href="` + u + `">` + u + "</a>")
+		}
+		b.WriteString("</td></tr>")
+		io.WriteString(w, b.String())
+	}
+	io.WriteString(w, "</table></div></body></html>")
+}
+
+// statsHandler: one-shot summary of the dataset - cheap queries only:
+// row/size totals from part metadata, freshness from certs_idx's PK max,
+// an ingest-rate estimate from a cert_index-delta probe, and issuer
+// coverage from the small issuer_stats table. No full scans.
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	qctx, qcancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer qcancel()
+
+	st := struct {
+		TotalCerts   uint64    `json:"total_certs"`
+		StorageBytes uint64    `json:"storage_bytes"`
+		ActiveParts  uint64    `json:"active_parts"`
+		MaxCertIndex uint64    `json:"max_cert_index"`
+		LastSeen     time.Time `json:"last_seen"`
+		IngestPerMin float64   `json:"ingest_rows_per_min"`
+		IssuerDNs    uint64    `json:"issuer_dns"`
+		IssuedLeafs  uint64    `json:"issued_leafs"`
+		IssuerCover  float64   `json:"issuer_coverage"`
+		TopIssuers   []caRow   `json:"top_issuers,omitempty"`
+	}{}
+	one := func(q string, dst []any, args ...any) {
+		_ = chConn.QueryRow(qctx, q, args...).Scan(dst...)
+	}
+	one(`SELECT count() FROM `+flagDBOr()+`.`+flagTableOr(), []any{&st.TotalCerts})
+	one(`SELECT sum(bytes_on_disk), count() FROM system.parts
+	     WHERE database = ? AND `+"`table`"+` = ? AND active`,
+		[]any{&st.StorageBytes, &st.ActiveParts}, flagDBOr(), flagTableOr())
+	if flagIdxOr() != "" {
+		one(`SELECT max(cert_index) FROM `+flagIdxOr(), []any{&st.MaxCertIndex})
+	}
+	if st.MaxCertIndex == 0 {
+		one(`SELECT max(cert_index) FROM `+flagDBOr()+`.`+flagTableOr(), []any{&st.MaxCertIndex})
+	}
+	if st.MaxCertIndex > 0 {
+		// newest row's insert timestamp; cert_index is only in the PK via a
+		// trailing position, so reach it through certs_idx's domain seek
+		if flagIdxOr() != "" {
+			one(`SELECT timestamp FROM `+flagDBOr()+`.`+flagTableOr()+`
+			     WHERE domain IN (SELECT domain FROM `+flagIdxOr()+`
+			            WHERE cert_index = ?) AND cert_index = ? LIMIT 1`,
+				[]any{&st.LastSeen}, st.MaxCertIndex, st.MaxCertIndex)
+		} else {
+			one(`SELECT timestamp FROM `+flagDBOr()+`.`+flagTableOr()+`
+			     WHERE cert_index = ? LIMIT 1`, []any{&st.LastSeen}, st.MaxCertIndex)
+		}
+	}
+	// ingest rate: rows added in the last 5M cert_indexes over the wall
+	// time that batch covers. Two point lookups - no scan.
+	const probe = 5000000
+	var boundary time.Time
+	if flagIdxOr() != "" && st.MaxCertIndex > probe {
+		b := st.MaxCertIndex - probe
+		one(`SELECT timestamp FROM `+flagDBOr()+`.`+flagTableOr()+`
+		     WHERE domain IN (SELECT domain FROM `+flagIdxOr()+`
+		            WHERE cert_index = ?) AND cert_index = ? LIMIT 1`,
+			[]any{&boundary}, b, b)
+		if !boundary.IsZero() && st.LastSeen.After(boundary) {
+			st.IngestPerMin = probe / st.LastSeen.Sub(boundary).Minutes()
+		}
+	}
+	one(`SELECT count(), sum(leafs) FROM `+flagDBOr()+`.issuer_stats`,
+		[]any{&st.IssuerDNs, &st.IssuedLeafs})
+	if st.TotalCerts > 0 {
+		st.IssuerCover = float64(st.IssuedLeafs) / float64(st.TotalCerts) * 100
+	}
+	rows, err := chConn.Query(qctx,
+		`SELECT name, leafs, first_seen, last_seen FROM `+flagDBOr()+`.issuer_stats
+		 ORDER BY leafs DESC LIMIT 10`)
+	if err == nil {
+		for rows.Next() {
+			var c caRow
+			if rows.Scan(&c.Name, &c.Leafs, &c.FirstSeen, &c.LastSeen) == nil {
+				st.TopIssuers = append(st.TopIssuers, c)
+			}
+		}
+		rows.Close()
+	}
+
+	if wantsJSON(r) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(st)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	headTpl.Execute(w, formData{Base: base})
+	fmt.Fprintf(w, `<div class="tw"><table>
+<tr><th>certs</th><td>%d</td></tr>
+<tr><th>storage</th><td>%.1f GiB (%d parts)</td></tr>
+<tr><th>max cert_index</th><td><a href="cert/%d">%d</a></td></tr>
+<tr><th>last seen</th><td>%s</td></tr>
+<tr><th>ingest rate</th><td>~%.0f rows/min</td></tr>
+<tr><th>issuer coverage</th><td>%d DNs, %d leafs (%.1f%%)</td></tr>
+</table>`,
+		st.TotalCerts, float64(st.StorageBytes)/(1<<30), st.ActiveParts,
+		st.MaxCertIndex, st.MaxCertIndex, st.LastSeen.Format("2006-01-02 15:04:05 UTC"),
+		st.IngestPerMin, st.IssuerDNs, st.IssuedLeafs, st.IssuerCover)
+	io.WriteString(w, `<h4>top issuers</h4><table><tr><th>issuer</th><th>leafs</th><th>first seen</th><th>last seen</th></tr>`)
+	for _, c := range st.TopIssuers {
+		fmt.Fprintf(w, `<tr><td><a href="search?q=issuer%%3A%s">%s</a></td><td>%d</td><td>%s</td><td>%s</td></tr>`,
+			url.QueryEscape(issuerCN(c.Name)), template.HTMLEscapeString(c.Name),
+			c.Leafs, c.FirstSeen.Format("2006-01-02"), c.LastSeen.Format("2006-01-02"))
+	}
+	io.WriteString(w, `</table></div><p class="hint">issuer coverage counts are refreshed by a manual GROUP BY, not live.</p></body></html>`)
+}
+
+func wantsJSON(r *http.Request) bool {
+	if r.URL.Query().Get("output") == "json" {
+		return true
+	}
+	a := r.Header.Get("Accept")
+	return strings.Contains(a, "application/json") || strings.Contains(a, "x-ndjson")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func flagDBOr() string    { return *flagDB }
 func flagTableOr() string { return *flagTable }
 func flagIdxOr() string {
@@ -1358,6 +1610,8 @@ func main() {
 	mux.HandleFunc("/", indexHandler)
 	mux.HandleFunc("/search", searchHandler)
 	mux.HandleFunc("/cert/", certHandler)
+	mux.HandleFunc("/ca", caHandler)
+	mux.HandleFunc("/stats", statsHandler)
 	mux.HandleFunc("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")
 		io.WriteString(w, openapiSpec)
