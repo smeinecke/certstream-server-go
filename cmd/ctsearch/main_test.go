@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDomScope(t *testing.T) {
 	w, args := domScope("github.com")
@@ -120,6 +123,16 @@ func TestNamesQueryPublicSuffixPrefilter(t *testing.T) {
 	p = parseQuery("names:%.github.io")
 	if want := `domain = ? OR endsWith(domain, ?)`; p.where != want {
 		t.Fatalf("where = %q, want %q", p.where, want)
+	}
+}
+
+func TestParseQueryIssuer(t *testing.T) {
+	p := parseQuery("issuer:Let's Encrypt")
+	if p.kind != "issuer" || len(p.args) != 1 || p.args[0] != "Let's Encrypt" {
+		t.Fatalf("issuer parse = %+v", p)
+	}
+	if !strings.Contains(p.where, "issuer") {
+		t.Fatalf("where = %q", p.where)
 	}
 }
 

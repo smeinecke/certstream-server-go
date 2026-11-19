@@ -56,8 +56,20 @@ paths:
         | Accept contains       | Behaviour |
         |-----------------------|-----------|
         | `text/event-stream`   | SSE stream: `row` / `status` / `end` / `err` events |
+        | `application/json` or `application/x-ndjson` | NDJSON stream (same rows, JSON lines) - see below |
         | `text/html`           | Instant-loading shell page; its inline script re-opens the same URL as an EventSource - survives response-buffering proxies |
         | anything else (curl)  | Plain streaming HTML page, rows inline as they arrive |
+
+        `?output=json` also forces the NDJSON stream regardless of
+        `Accept`. NDJSON emits one object per line:
+        `{"type":"status","msg":..}` progress, `{"type":"hb"}` keepalive,
+        `{"type":"row","cert_index":..,"seen":..,"not_before":..,
+        "not_after":..,"cn":..,"domain":..,"serial_number":..,"o":..,
+        "hostnames":[..]}` per cert, `{"type":"name","domain":..,
+        "cert_index":..,"count":..,"example":..}` per `names:` row,
+        `{"type":"error","msg":..}` on failure, and a terminating
+        `{"type":"end","kind":..,"count":..,"truncated":..,
+        "next_after":..,"next_afterd":..,"elapsed_ms":..}`.
 
         **Query grammar** (value of `q`, case-insensitive prefixes,
         domain literals lowercased):
@@ -77,6 +89,7 @@ paths:
         | `serial:<n>` | serial number | `i_sn` bloom - slow |
         | `cn:<name>` | subject CN exact | `i_cn` bloom - slow |
         | `idx:<n>`, bare integer | cert_index | `certs_idx` + domain PK seeks |
+        | `issuer:<ca>` | case-insensitive substring on the issuer DN (`/C=US/O=.../CN=...`) | `issuer` column scan - rows without a recorded issuer (pre-column, CA never logged) are unreachable |
 
         **Pagination.** Row searches return at most `-limit` rows; when
         more exist the footer (`end` event / page footer) links
@@ -88,8 +101,10 @@ paths:
 
         `names:` queries are NOT paginated - the GROUP BY already
         materializes the full match set, so every distinct name is
-        streamed in one response (`afterd` is still honoured as a
-        manual `domain >` filter if passed).
+        streamed in one response, capped at 50000 displayed rows
+        (`afterd` remains honoured as a manual `domain >` filter and
+        is the resume cursor when the cap truncates - the `end`
+        object's `next_afterd` carries it).
 
         **Timing.** A server-side `-query-timeout` (default 285s) bounds
         each query; a proxy read timeout above that is required for slow
@@ -139,6 +154,25 @@ paths:
             pattern match like `names:*bla*` remains explainable.
             Accepted values: `1`, `true`, `on`.
           schema: { type: string, enum: ["1", "true", "on"] }
+        - name: noexp
+          in: query
+          required: false
+          description: >
+            Hide expired certificates (`not_after >= now`), applied to
+            every row and `names:` aggregation. crt.sh's
+            `exclude=expired` is also accepted.
+            Accepted values: `1`, `true`, `on`.
+          schema: { type: string, enum: ["1", "true", "on"] }
+        - name: exclude
+          in: query
+          required: false
+          description: crt.sh-compatible filter - only `expired` is supported
+          schema: { type: string, enum: ["expired"] }
+        - name: output
+          in: query
+          required: false
+          description: "`json` forces the NDJSON stream regardless of Accept"
+          schema: { type: string, enum: ["json"] }
       responses:
         "200":
           description: |
@@ -183,6 +217,14 @@ paths:
                   loading widget + EventSource script). Other Accept
                   values return the same markup streamed inline with
                   `<tr>` rows appended as they are produced.
+            application/x-ndjson:
+              schema:
+                type: string
+                description: >
+                  One JSON object per line - `row`/`name` result objects,
+                  `status`/`hb` liveness lines, `error`, and a final `end`
+                  object with `count`, `truncated`, `next_after`,
+                  `next_afterd` cursor fields and `elapsed_ms`.
         "400":
           description: Never produced - bad input degrades to an empty result or error text
           content:
@@ -197,6 +239,8 @@ paths:
         fields, complete SAN list, serial, fingerprint, signature
         algorithm, AKI/SKI, AIA, key/extended key usage, basic
         constraints, certificate policies, SCT list, tld, root_domain,
+        issuer (issuer DN when recorded - empty for rows predating the
+        column),
         cert_link. Routed through certs_idx so the lookup is domain-PK
         seeks, not a wide-table scan.
       parameters:

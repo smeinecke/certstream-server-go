@@ -23,9 +23,9 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/certificatetransparency"
-	"github.com/d-Rickyy-b/certstream-server-go/internal/tmpip"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/config"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/models"
+	"github.com/d-Rickyy-b/certstream-server-go/internal/tmpip"
 	"golang.org/x/net/publicsuffix"
 
 	ct "github.com/google/certificate-transparency-go"
@@ -38,34 +38,35 @@ var userAgent = fmt.Sprintf("Certstream v%s (github.com/d-Rickyy-b/certstream-se
 // CertificateRow holds the fields to insert into ClickHouse
 // (matches the Rust struct)
 type CertificateRow struct {
-	CertIndex                    int64
-	CertLink                     string
-	Domain                       string
-	Hostnames                    string // JSON array
-	TLD                          string
-	RootDomain                   string
-	Fingerprint                  string
-	NotAfter                     int64
-	NotBefore                    int64
-	SerialNumber                 string
-	C                            string
-	CN                           string
-	L                            string
-	O                            string
-	OU                           string
-	ST                           string
-	Aggregated                   string
-	EmailAddress                 string
-	AuthorityInfoAccess          string
-	AuthorityKeyIdentifier       string
-	BasicConstraints             string
-	CertificatePolicies          string
+	CertIndex                     int64
+	CertLink                      string
+	Domain                        string
+	Hostnames                     string // JSON array
+	TLD                           string
+	RootDomain                    string
+	Fingerprint                   string
+	NotAfter                      int64
+	NotBefore                     int64
+	SerialNumber                  string
+	C                             string
+	CN                            string
+	L                             string
+	O                             string
+	OU                            string
+	ST                            string
+	Aggregated                    string
+	EmailAddress                  string
+	AuthorityInfoAccess           string
+	AuthorityKeyIdentifier        string
+	BasicConstraints              string
+	CertificatePolicies           string
 	CtlSignedCertificateTimestamp string
-	ExtendedKeyUsage             string
-	KeyUsage                     string
-	SubjectAltName               string
-	SubjectKeyIdentifier         string
-	SignatureAlgorithm           string
+	ExtendedKeyUsage              string
+	KeyUsage                      string
+	SubjectAltName                string
+	SubjectKeyIdentifier          string
+	SignatureAlgorithm            string
+	Issuer                        string
 }
 
 func strOr(p *string) string {
@@ -162,34 +163,34 @@ func reformatCertFields(data *models.Data) CertificateRow {
 		}
 	}
 	return CertificateRow{
-		CertIndex:    int64(data.CertIndex),
-		CertLink:     data.CertLink,
-		Fingerprint:  data.LeafCert.Fingerprint,
-		NotAfter:     data.LeafCert.NotAfter,
-		NotBefore:    data.LeafCert.NotBefore,
-		SerialNumber: data.LeafCert.SerialNumber,
-		C:            getField("C", data.LeafCert.Subject.C),
-		CN:           getField("CN", data.LeafCert.Subject.CN),
-		L:            getField("L", data.LeafCert.Subject.L),
-		O:            getField("O", data.LeafCert.Subject.O),
-		OU:           getField("OU", data.LeafCert.Subject.OU),
-		ST:           getField("ST", data.LeafCert.Subject.ST),
-		Aggregated:   strOr(data.LeafCert.Subject.Aggregated),
-		EmailAddress: getField("emailAddress", data.LeafCert.Subject.EmailAddress),
-		Domain:       domain,
-		Hostnames:    string(hostnamesJSON),
-		TLD:          tld,
-		RootDomain:   rootDomain,
-		AuthorityInfoAccess:          strOr(data.LeafCert.Extensions.AuthorityInfoAccess),
-		AuthorityKeyIdentifier:       strOr(data.LeafCert.Extensions.AuthorityKeyIdentifier),
-		BasicConstraints:             strOr(data.LeafCert.Extensions.BasicConstraints),
-		CertificatePolicies:          strOr(data.LeafCert.Extensions.CertificatePolicies),
+		CertIndex:                     int64(data.CertIndex),
+		CertLink:                      data.CertLink,
+		Fingerprint:                   data.LeafCert.Fingerprint,
+		NotAfter:                      data.LeafCert.NotAfter,
+		NotBefore:                     data.LeafCert.NotBefore,
+		SerialNumber:                  data.LeafCert.SerialNumber,
+		C:                             getField("C", data.LeafCert.Subject.C),
+		CN:                            getField("CN", data.LeafCert.Subject.CN),
+		L:                             getField("L", data.LeafCert.Subject.L),
+		O:                             getField("O", data.LeafCert.Subject.O),
+		OU:                            getField("OU", data.LeafCert.Subject.OU),
+		ST:                            getField("ST", data.LeafCert.Subject.ST),
+		Aggregated:                    strOr(data.LeafCert.Subject.Aggregated),
+		EmailAddress:                  getField("emailAddress", data.LeafCert.Subject.EmailAddress),
+		Domain:                        domain,
+		Hostnames:                     string(hostnamesJSON),
+		TLD:                           tld,
+		RootDomain:                    rootDomain,
+		AuthorityInfoAccess:           strOr(data.LeafCert.Extensions.AuthorityInfoAccess),
+		AuthorityKeyIdentifier:        strOr(data.LeafCert.Extensions.AuthorityKeyIdentifier),
+		BasicConstraints:              strOr(data.LeafCert.Extensions.BasicConstraints),
+		CertificatePolicies:           strOr(data.LeafCert.Extensions.CertificatePolicies),
 		CtlSignedCertificateTimestamp: strOr(data.LeafCert.Extensions.CtlSignedCertificateTimestamp),
-		ExtendedKeyUsage:             strOr(data.LeafCert.Extensions.ExtendedKeyUsage),
-		KeyUsage:                     strOr(data.LeafCert.Extensions.KeyUsage),
-		SubjectAltName:               strOr(data.LeafCert.Extensions.SubjectAltName),
-		SubjectKeyIdentifier:         strOr(data.LeafCert.Extensions.SubjectKeyIdentifier),
-		SignatureAlgorithm:           data.LeafCert.SignatureAlgorithm,
+		ExtendedKeyUsage:              strOr(data.LeafCert.Extensions.ExtendedKeyUsage),
+		KeyUsage:                      strOr(data.LeafCert.Extensions.KeyUsage),
+		SubjectAltName:                strOr(data.LeafCert.Extensions.SubjectAltName),
+		SubjectKeyIdentifier:          strOr(data.LeafCert.Extensions.SubjectKeyIdentifier),
+		SignatureAlgorithm:            data.LeafCert.SignatureAlgorithm,
 	}
 }
 
@@ -387,34 +388,34 @@ type groupResult struct {
 }
 
 var (
-	flagLog          = flag.String("log", "", "URL of the CT log - e.g. ct.googleapis.com/logs/eu1/xenon2025h2")
-	flagStart        = flag.Int64("start", 0, "Start index of the CT log range (inclusive)")
-	flagEnd          = flag.Int64("end", 0, "End index (inclusive), or -1 to resolve to current tree head")
-	flagFetchBatch   = flag.Int64("batch-size", 256, "Entries per get-entries request (log may cap this)")
-	flagGroupSize    = flag.Int64("group-size", 4096, "Entries per ClickHouse insert / resume unit")
-	flagAsDER        = flag.Bool("asder", false, "Include DER encoding of the certificate")
-	flagConcurrency  = flag.Int("concurrency", 4, "Concurrent fetch+insert workers")
-	flagEntryType    = flag.String("entry-type", "all", "Which leaf entries to keep: all|precert|x509")
-	flagTiled        = flag.Bool("tiled", false, "Log is a static-CT (tiled) log - fetch binary tiles instead of get-entries")
-	flagQPS          = flag.Float64("qps", 0, "Max get-entries requests per second (0 = unlimited)")
-	flagMaxRetries   = flag.Int("max-retries", 8, "Retries per fetch/insert before giving up")
-	flagMaxPasses    = flag.Int("max-passes", 3, "Extra passes over failed ranges")
-	flagStateFile    = flag.String("state-file", "", "Resume state file (enables resume/checkpointing)")
-	flagFresh        = flag.Bool("fresh", false, "Ignore an existing state file")
-	flagSrc6         = flag.String("src6", "", "Rotate source IPv6 within this prefix (e.g. 2a01:d0:ffff:342e::/64) - requires AAAA on the log host")
-	flagTmpIP        = flag.Bool("tmpip", false, "Rotate source IPv6 across all Devices in /etc/tmpiprest.conf")
-	flagTmpIPConf    = flag.String("tmpip-conf", "/etc/tmpiprest.conf", "tmpiprest config path (used with -tmpip)")
-	flagSrc6PerReq   = flag.Bool("src6-per-request", false, "New source IP per request instead of per connection (slower: TLS per request)")
-	flagProxy        = flag.String("proxy", "", "HTTP CONNECT proxy for CT fetches, e.g. http://127.0.0.1:1080 - run tmpipproxy on the tunnel host to rotate source IPv6 there")
-	flagVerify       = flag.Bool("verify", false, "Differential-test fastRow against the full parser per entry; log mismatches")
-	flagProgress     = flag.Duration("progress-every", 30*time.Second, "Progress log interval")
-	flagCHDSN        = flag.String("clickhouse-dsn", "", "ClickHouse host:port, e.g. '127.0.0.1:9000'")
-	flagCHDB         = flag.String("clickhouse-database", "certstream", "ClickHouse database")
-	flagCHTable      = flag.String("clickhouse-table", "certs", "ClickHouse table name")
-	flagCHUser       = flag.String("clickhouse-user", "default", "ClickHouse user")
-	flagCHPass       = flag.String("clickhouse-password", "", "ClickHouse password")
-	flagCHPassFile   = flag.String("clickhouse-password-file", "", "File containing the ClickHouse password (overrides -clickhouse-password)")
-	flagQuiet        = flag.Bool("quiet", false, "Do not write JSON entries to stdout")
+	flagLog         = flag.String("log", "", "URL of the CT log - e.g. ct.googleapis.com/logs/eu1/xenon2025h2")
+	flagStart       = flag.Int64("start", 0, "Start index of the CT log range (inclusive)")
+	flagEnd         = flag.Int64("end", 0, "End index (inclusive), or -1 to resolve to current tree head")
+	flagFetchBatch  = flag.Int64("batch-size", 256, "Entries per get-entries request (log may cap this)")
+	flagGroupSize   = flag.Int64("group-size", 4096, "Entries per ClickHouse insert / resume unit")
+	flagAsDER       = flag.Bool("asder", false, "Include DER encoding of the certificate")
+	flagConcurrency = flag.Int("concurrency", 4, "Concurrent fetch+insert workers")
+	flagEntryType   = flag.String("entry-type", "all", "Which leaf entries to keep: all|precert|x509")
+	flagTiled       = flag.Bool("tiled", false, "Log is a static-CT (tiled) log - fetch binary tiles instead of get-entries")
+	flagQPS         = flag.Float64("qps", 0, "Max get-entries requests per second (0 = unlimited)")
+	flagMaxRetries  = flag.Int("max-retries", 8, "Retries per fetch/insert before giving up")
+	flagMaxPasses   = flag.Int("max-passes", 3, "Extra passes over failed ranges")
+	flagStateFile   = flag.String("state-file", "", "Resume state file (enables resume/checkpointing)")
+	flagFresh       = flag.Bool("fresh", false, "Ignore an existing state file")
+	flagSrc6        = flag.String("src6", "", "Rotate source IPv6 within this prefix (e.g. 2a01:d0:ffff:342e::/64) - requires AAAA on the log host")
+	flagTmpIP       = flag.Bool("tmpip", false, "Rotate source IPv6 across all Devices in /etc/tmpiprest.conf")
+	flagTmpIPConf   = flag.String("tmpip-conf", "/etc/tmpiprest.conf", "tmpiprest config path (used with -tmpip)")
+	flagSrc6PerReq  = flag.Bool("src6-per-request", false, "New source IP per request instead of per connection (slower: TLS per request)")
+	flagProxy       = flag.String("proxy", "", "HTTP CONNECT proxy for CT fetches, e.g. http://127.0.0.1:1080 - run tmpipproxy on the tunnel host to rotate source IPv6 there")
+	flagVerify      = flag.Bool("verify", false, "Differential-test fastRow against the full parser per entry; log mismatches")
+	flagProgress    = flag.Duration("progress-every", 30*time.Second, "Progress log interval")
+	flagCHDSN       = flag.String("clickhouse-dsn", "", "ClickHouse host:port, e.g. '127.0.0.1:9000'")
+	flagCHDB        = flag.String("clickhouse-database", "certstream", "ClickHouse database")
+	flagCHTable     = flag.String("clickhouse-table", "certs", "ClickHouse table name")
+	flagCHUser      = flag.String("clickhouse-user", "default", "ClickHouse user")
+	flagCHPass      = flag.String("clickhouse-password", "", "ClickHouse password")
+	flagCHPassFile  = flag.String("clickhouse-password-file", "", "File containing the ClickHouse password (overrides -clickhouse-password)")
+	flagQuiet       = flag.Bool("quiet", false, "Do not write JSON entries to stdout")
 )
 
 func min64(a, b int64) int64 {
@@ -482,8 +483,8 @@ func insertWithRetry(ctx context.Context, chConn clickhouse.Conn, db, table stri
 	}))
 	for attempt := 0; attempt <= *flagMaxRetries; attempt++ {
 		batch, err := chConn.PrepareBatch(dedupCtx, fmt.Sprintf(`INSERT INTO %s.%s (
-			cert_index, cert_link, domain, hostnames, tld, root_domain, fingerprint, not_after, not_before, serial_number, c, cn, l, o, ou, st, aggregated, email_address, authority_info_access, authority_key_identifier, basic_constraints, certificate_policies, ctl_signed_certificate_timestamp, extended_key_usage, key_usage, subject_alt_name, subject_key_identifier, signature_algorithm)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, db, table))
+			cert_index, cert_link, domain, hostnames, tld, root_domain, fingerprint, not_after, not_before, serial_number, c, cn, l, o, ou, st, aggregated, email_address, authority_info_access, authority_key_identifier, basic_constraints, certificate_policies, ctl_signed_certificate_timestamp, extended_key_usage, key_usage, subject_alt_name, subject_key_identifier, signature_algorithm, issuer)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, db, table))
 		if err != nil {
 			lastErr = err
 		} else {
@@ -497,6 +498,7 @@ func insertWithRetry(ctx context.Context, chConn clickhouse.Conn, db, table stri
 					r.AuthorityInfoAccess, r.AuthorityKeyIdentifier, r.BasicConstraints,
 					r.CertificatePolicies, r.CtlSignedCertificateTimestamp, r.ExtendedKeyUsage,
 					r.KeyUsage, r.SubjectAltName, r.SubjectKeyIdentifier, r.SignatureAlgorithm,
+					r.Issuer,
 				); appendErr != nil {
 					lastErr = appendErr
 					appendFailed = true
@@ -921,7 +923,7 @@ func main() {
 			MaxOpenConns:    64,
 			MaxIdleConns:    32,
 			ConnMaxLifetime: 10 * time.Minute,
-			Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
+			Compression:     &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
 		})
 		if err != nil {
 			log.Fatalf("Failed to connect to ClickHouse: %v", err)

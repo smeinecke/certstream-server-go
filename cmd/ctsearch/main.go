@@ -55,11 +55,18 @@ type row struct {
 	Serial      string
 	O           string
 	Hostnames   string
+	Issuer      string
+	Names       []string // hostnames decoded - filled only for JSON output
 	Hl          []string // literal fragments to <mark> in Hostnames/CN
 	Fingerprint string
 	CertLink    string
 	AKI         string
 	SigAlg      string
+}
+
+type formData struct {
+	Query, Base  string
+	Dedup, Noexp bool
 }
 
 type resultPage struct {
@@ -227,6 +234,17 @@ func parseQuery(q string) parsed {
 			p.domwhere, p.domargs = domScope(v)
 		}
 		return p
+	case strings.HasPrefix(low, "issuer:"):
+		// substring match on the issuer DN ("/C=US/O=Let's Encrypt/CN=R11")
+		// - case-insensitive like crt.sh's CA search. Rows whose issuer was
+		// never recorded (pre-column data or CA not logged to CT) keep
+		// issuer='' and are not reachable this way.
+		v := strings.TrimSpace(q[7:])
+		if v == "" {
+			return parsed{`1 = 0`, nil, "issuer", true, false, "", nil, "", nil, "", nil}
+		}
+		return parsed{`positionCaseInsensitive(issuer, ?) > 0`, []any{v},
+			"issuer", false, false, "", nil, "", nil, "", nil}
 	}
 
 	if n, err := strconv.ParseUint(q, 10, 64); err == nil {
@@ -470,11 +488,12 @@ vertical-align:-2px;margin-right:.4em}
 <input type="text" name="q" value="{{.Query}}" autofocus placeholder="%.example.com | example.com | fp: | serial: | cn: | idx:">
 <input type="submit" value="Search">
 <label title="names: only - fold results to registrable domains"><input type="checkbox" name="dedup" value="1"{{if .Dedup}} checked{{end}}> domains only</label>
+<label title="hide expired certificates"><input type="checkbox" name="noexp" value="1"{{if .Noexp}} checked{{end}}> hide expired</label>
 </form>
 <p class="hint">
 %.example.com = subdomains &nbsp;&middot;&nbsp; example.com = name + subdomains &nbsp;&middot;&nbsp;
 % and * wildcards anywhere (foo%, %brand%) &nbsp;&middot;&nbsp;
-names:&lt;filter&gt; = distinct names &nbsp;&middot;&nbsp; domain:&lt;d&gt; = root_domain field &nbsp;&middot;&nbsp;
+names:&lt;filter&gt; = distinct names &nbsp;&middot;&nbsp; domain:&lt;d&gt; = root_domain field &nbsp;&middot;&nbsp; issuer:&lt;ca&gt; &nbsp;&middot;&nbsp;
 fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt; &middot; <a href="openapi.yaml">api</a>
 </p>
 <script>
@@ -493,7 +512,8 @@ try{sessionStorage.setItem(k,JSON.stringify(st))}catch(e){}
 function goPrev(){
 var u=new URL(location),q=u.searchParams.get('q'),p=parseInt(u.searchParams.get('page'))||1;
 if(p<=1)return false;
-var v='search?q='+encodeURIComponent(q)+'&page='+(p-1);
+var x='{{if .Dedup}}&dedup=1{{end}}{{if .Noexp}}&noexp=1{{end}}';
+var v='search?q='+encodeURIComponent(q)+x+'&page='+(p-1);
 if(p>2){
 var c=null;
 try{c=JSON.parse(sessionStorage.getItem('ctcur:'+location.pathname+'|'+q)||'[]')[p-1]}catch(e){}
@@ -536,9 +556,9 @@ var nameRowTpl = template.Must(template.New("nrow").Funcs(
 </tr>`))
 
 var footTpl = template.Must(template.New("foot").Funcs(
-	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`<p>{{.Kind}}: {{.Count}} row(s){{if .HaveNext}}+ (page limit){{end}} in {{.Elapsed}} &middot; page {{.Page}}
+	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`<p>{{.Kind}}: {{.Count}} row(s){{if .HaveNext}}{{if .Names}} (display cap - more exist){{else}}+ (page limit){{end}}{{end}} in {{.Elapsed}} &middot; page {{.Page}}
 {{if .PrevOK}}&nbsp; <a href="#" onclick="return goPrev()">&larr; prev</a>{{end}}
-{{if .HaveNext}}&nbsp; <a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}{{if .NextDom}}&amp;afterd={{urlquery .NextDom}}{{end}}&amp;page={{.NextPage}}">next page &rarr;</a>{{end}}</p>`))
+{{if and .HaveNext (not .Names)}}&nbsp; <a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}{{if .NextDom}}&amp;afterd={{urlquery .NextDom}}{{end}}&amp;page={{.NextPage}}{{if .Dedup}}&amp;dedup=1{{end}}{{if .Noexp}}&amp;noexp=1{{end}}">next page &rarr;</a>{{end}}</p>`))
 
 var certTpl = template.Must(template.New("cert").Funcs(
 	template.FuncMap{"ts": tsFormat}).Parse(`<!DOCTYPE html>
@@ -576,8 +596,8 @@ pre{white-space:pre-wrap;word-break:break-all;margin:0}
 <tr><th>scts</th><td><pre>{{.SCT}}</pre></td></tr>
 <tr><th>tld / root_domain</th><td>{{.TLD}} / {{.RootDomain}}</td></tr>
 <tr><th>cert_link</th><td><a href="{{.CertLink}}">{{.CertLink}}</a></td></tr>
+<tr><th>issuer</th><td>{{if .Issuer}}{{.Issuer}}{{else}}<span class="hint">not recorded (pre-column row)</span>{{end}}</td></tr>
 </table></div>
-<p class="hint">issuer CN/O not stored - only AKI. DER fetch: <a href="{{.CertLink}}">cert_link</a></p>
 {{end}}
 </body></html>`))
 
@@ -639,6 +659,8 @@ func tplStr(t *template.Template, data any) string {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	acc := r.Header.Get("Accept")
 	switch {
+	case r.URL.Query().Get("output") == "json" || strings.Contains(acc, "application/json") || strings.Contains(acc, "x-ndjson"):
+		searchJSON(w, r)
 	case strings.Contains(acc, "text/event-stream"):
 		searchSSE(w, r)
 	case strings.Contains(acc, "text/html"):
@@ -651,10 +673,24 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 // runSearch executes the parsed query and calls emitRow per display
 // row; emitStatus (may be nil) reports phase progress for streamed UIs.
 // Returns the error text, row count, and pagination cursor.
-func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, dedup bool,
+func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, dedup bool, noexp bool,
 	emitRow func(row), emitName func(nameRow), emitStatus func(string)) (qErr string, count int, haveNext bool, lastIdx uint64, lastDom string) {
 
 	terms := hlTerms(pq)
+	if noexp {
+		// hide already-expired certs - appended to every predicate shape:
+		// the plain/names where, and the phase-2 SAN re-check when set.
+		// Phase-1 index seeks can't filter it (certs_idx/certs_dom have no
+		// not_after column) and just return slightly stale index sets that
+		// phase 2 then prunes.
+		now := uint64(time.Now().Unix())
+		pq.where += " AND not_after >= ?"
+		pq.args = append(pq.args, now)
+		if pq.p2where != "" {
+			pq.p2where += " AND not_after >= ?"
+			pq.p2args = append(pq.p2args, now)
+		}
+	}
 	var lastSt time.Time
 	status := func(s string) {
 		// throttle to one update per 2s - scans emit no rows, so these
@@ -706,7 +742,12 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 			return
 		}
 		defer nr.Close()
+		const namesCap = 50000 // display cap - unbounded tables kill browsers
 		for nr.Next() {
+			if count >= namesCap {
+				haveNext = true // truncated - 'more exist' signal for foot/JSON
+				break
+			}
 			var v nameRow
 			var err error
 			if dedup {
@@ -747,13 +788,13 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 	}
 	args = append(args, *flagLimit+1)
 
-	const cols = `cert_index, timestamp, not_before, not_after, cn, domain, serial_number, o, hostnames`
+	const cols = `cert_index, timestamp, not_before, not_after, cn, domain, serial_number, o, hostnames, issuer`
 	emit := func(rows driver.Rows, capRows bool) {
 		defer rows.Close()
 		for rows.Next() {
 			var rw row
 			if err := rows.Scan(&rw.Index, &rw.Seen, &rw.NotBefore, &rw.NotAfter,
-				&rw.CN, &rw.Domain, &rw.Serial, &rw.O, &rw.Hostnames); err != nil {
+				&rw.CN, &rw.Domain, &rw.Serial, &rw.O, &rw.Hostnames, &rw.Issuer); err != nil {
 				qErr = "scan: " + err.Error()
 				return
 			}
@@ -767,6 +808,9 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 			if rw.Index >= lastIdx {
 				lastIdx, lastDom = rw.Index, rw.Domain
 			}
+			// decode once for JSON emitters; HTML emitters use the
+			// joined form below. Unbounded (names:) never reaches here.
+			json.Unmarshal([]byte(rw.Hostnames), &rw.Names)
 			rw.Hostnames = shortNames(rw.Hostnames, 200)
 			rw.Hl = terms
 			emitRow(rw)
@@ -916,7 +960,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 }
 
 // searchArgs pulls the query params shared by all response modes.
-func searchArgs(r *http.Request) (q string, after uint64, afterd string, page int, pq parsed, dedup bool) {
+func searchArgs(r *http.Request) (q string, after uint64, afterd string, page int, pq parsed, dedup bool, noexp bool) {
 	q = r.URL.Query().Get("q")
 	after, _ = strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
 	afterd = r.URL.Query().Get("afterd")
@@ -928,6 +972,14 @@ func searchArgs(r *http.Request) (q string, after uint64, afterd string, page in
 	switch r.URL.Query().Get("dedup") {
 	case "1", "true", "on":
 		dedup = true
+	}
+	// crt.sh-style exclude=expired, plus a short form for the UI checkbox
+	if r.URL.Query().Get("exclude") == "expired" {
+		noexp = true
+	}
+	switch r.URL.Query().Get("noexp") {
+	case "1", "true", "on":
+		noexp = true
 	}
 	return
 }
@@ -943,6 +995,9 @@ type footData struct {
 	Page      int
 	PrevOK    bool
 	NextPage  int
+	Dedup     bool
+	Noexp     bool
+	Names     bool
 }
 
 // searchShell serves the instant-loading page for browsers: markup and
@@ -951,9 +1006,9 @@ type footData struct {
 // this survives response-buffering proxies such as Cloudflare, which
 // would otherwise hold the whole page until the query finishes.
 func searchShell(w http.ResponseWriter, r *http.Request) {
-	q, _, _, _, pq, dedup := searchArgs(r)
+	q, _, _, _, pq, dedup, noexp := searchArgs(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	headTpl.Execute(w, struct{ Query, Base string; Dedup bool }{q, base, dedup})
+	headTpl.Execute(w, formData{q, base, dedup, noexp})
 	if q == "" {
 		io.WriteString(w, "</body></html>")
 		return
@@ -993,7 +1048,7 @@ func searchShell(w http.ResponseWriter, r *http.Request) {
 // plus a final `end` (footer html) or `err` event. Heartbeat comments
 // keep the connection alive through proxies during long scans.
 func searchSSE(w http.ResponseWriter, r *http.Request) {
-	q, after, afterd, page, pq, dedup := searchArgs(r)
+	q, after, afterd, page, pq, dedup, noexp := searchArgs(r)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -1019,7 +1074,7 @@ func searchSSE(w http.ResponseWriter, r *http.Request) {
 	defer hb.Stop()
 
 	start := time.Now()
-	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd, dedup,
+	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd, dedup, noexp,
 		func(rw row) { sse.send("row", tplStr(rowTpl, rw)) },
 		func(nr nameRow) { sse.send("row", tplStr(nameRowTpl, nr)) },
 		func(s string) { sse.send("status", s) })
@@ -1029,16 +1084,17 @@ func searchSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	sse.send("end", tplStr(footTpl, footData{
 		pq.kind, count, haveNext, lastIdx, lastDom,
-		time.Since(start).String(), q, page, page > 1, page + 1}))
+		time.Since(start).String(), q, page, page > 1, page + 1,
+		dedup, noexp, pq.names}))
 }
 
 // searchInline streams the plain-HTML page as before - for curl and
 // other non-browser clients that cannot consume SSE.
 func searchInline(w http.ResponseWriter, r *http.Request) {
-	q, after, afterd, page, pq, dedup := searchArgs(r)
+	q, after, afterd, page, pq, dedup, noexp := searchArgs(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Accel-Buffering", "no") // let rows trickle through nginx
-	headTpl.Execute(w, struct{ Query, Base string; Dedup bool }{q, base, dedup})
+	headTpl.Execute(w, formData{q, base, dedup, noexp})
 	if q == "" {
 		io.WriteString(w, "</body></html>")
 		return
@@ -1060,7 +1116,7 @@ func searchInline(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	var n int
-	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd, dedup,
+	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd, dedup, noexp,
 		func(rw row) {
 			rowTpl.Execute(w, rw)
 			if n++; fl != nil && n%16 == 0 {
@@ -1080,9 +1136,99 @@ func searchInline(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "</table></div>")
 		footTpl.Execute(w, footData{
 			pq.kind, count, haveNext, lastIdx, lastDom,
-			time.Since(start).String(), q, page, page > 1, page + 1})
+			time.Since(start).String(), q, page, page > 1, page + 1, dedup, noexp, pq.names})
 	}
 	io.WriteString(w, "</body></html>")
+}
+
+// searchJSON streams the result as NDJSON - one object per line:
+//
+//	{"type":"status","msg":..}    phase progress during long scans
+//	{"type":"row","cert_index":..,"hostnames":[..],..}   cert rows
+//	{"type":"name","domain":..,"count":..,..}            names: rows
+//	{"type":"end","count":..,"next_after":..,..}         terminator
+//	{"type":"error","msg":..}                            on failure
+//
+// Selected via ?output=json or an Accept of application/json / x-ndjson.
+func searchJSON(w http.ResponseWriter, r *http.Request) {
+	_, after, afterd, _, pq, dedup, noexp := searchArgs(r)
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Accel-Buffering", "no")
+	fl, _ := w.(http.Flusher)
+	var mu sync.Mutex // heartbeat goroutine and emit callbacks share w
+	wr := func(v any) {
+		mu.Lock()
+		defer mu.Unlock()
+		b, _ := json.Marshal(v)
+		w.Write(b)
+		w.Write([]byte{'\n'})
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+
+	qctx, qcancel := context.WithTimeout(r.Context(), *flagQTimeout)
+	defer qcancel()
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() { // keepalive through buffering proxies during long scans
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				wr(map[string]string{"type": "hb"})
+			}
+		}
+	}()
+
+	start := time.Now()
+	qErr, count, haveNext, lastIdx, lastDom := runSearch(qctx, pq, after, afterd, dedup, noexp,
+		func(rw row) {
+			wr(struct {
+				Type      string   `json:"type"`
+				CertIndex uint64   `json:"cert_index"`
+				Seen      string   `json:"seen"`
+				NotBefore uint64   `json:"not_before"`
+				NotAfter  uint64   `json:"not_after"`
+				CN        string   `json:"cn"`
+				Domain    string   `json:"domain"`
+				Serial    string   `json:"serial_number"`
+				O         string   `json:"o"`
+				Hostnames []string `json:"hostnames"`
+				Issuer    string   `json:"issuer,omitempty"`
+			}{"row", rw.Index, rw.Seen.UTC().Format(time.RFC3339),
+				rw.NotBefore, rw.NotAfter, rw.CN, rw.Domain,
+				rw.Serial, rw.O, rw.Names, rw.Issuer})
+		},
+		func(nr nameRow) {
+			wr(struct {
+				Type      string `json:"type"`
+				Domain    string `json:"domain"`
+				CertIndex uint64 `json:"cert_index"`
+				Count     uint64 `json:"count"`
+				Example   string `json:"example,omitempty"`
+			}{"name", nr.Domain, nr.Index, nr.Count, nr.Example})
+		},
+		func(s string) { wr(map[string]string{"type": "status", "msg": s}) })
+
+	if qErr != "" {
+		wr(map[string]string{"type": "error", "msg": qErr})
+		return
+	}
+	wr(struct {
+		Type      string `json:"type"`
+		Kind      string `json:"kind"`
+		Count     int    `json:"count"`
+		Truncated bool   `json:"truncated"`
+		NextAfter uint64 `json:"next_after,omitempty"`
+		NextDom   string `json:"next_afterd,omitempty"`
+		ElapsedMS int64  `json:"elapsed_ms"`
+	}{"end", pq.kind, count, haveNext, lastIdx, lastDom,
+		time.Since(start).Milliseconds()})
 }
 
 func shortNames(js string, max int) string {
@@ -1101,7 +1247,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	headTpl.Execute(w, struct{ Query, Base string; Dedup bool }{"", base, false})
+	headTpl.Execute(w, formData{Base: base})
 	io.WriteString(w, "</body></html>")
 }
 
@@ -1117,6 +1263,7 @@ func certHandler(w http.ResponseWriter, r *http.Request) {
 		NamesPretty, SAN, Serial, Fingerprint, SigAlg string
 		AKI, SKI, AIA, KU, EKU, BC, CP, SCT           string
 		TLD, RootDomain, CertLink                     string
+		Issuer                                        string
 	}{resultPage: resultPage{Base: base}}
 	if err != nil {
 		p.Err = "bad cert index"
@@ -1136,11 +1283,11 @@ func certHandler(w http.ResponseWriter, r *http.Request) {
 		        email_address, hostnames, subject_alt_name, serial_number, fingerprint,
 		        signature_algorithm, authority_key_identifier, subject_key_identifier,
 		        authority_info_access, key_usage, extended_key_usage, basic_constraints,
-		        certificate_policies, ctl_signed_certificate_timestamp, tld, root_domain, cert_link
+		        certificate_policies, ctl_signed_certificate_timestamp, tld, root_domain, cert_link, issuer
 		 FROM `+flagDBOr()+`.`+flagTableOr()+` WHERE `+pw.where+` LIMIT 1`, pw.args...)
 	if err := row.Scan(&p.Index, &ts, &nb, &na, &cn, &o, &l, &st, &c, &ou,
 		&email, &hn, &san, &ser, &fp, &alg, &aki, &ski, &aia, &ku, &eku, &bc,
-		&cp, &sct, &tld, &rd, &cl); err != nil {
+		&cp, &sct, &tld, &rd, &cl, &p.Issuer); err != nil {
 		p.Err = "not found: " + err.Error()
 		certTpl.Execute(w, p)
 		return

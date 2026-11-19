@@ -21,28 +21,28 @@ import (
 	"time"
 	"unicode/utf16"
 
-	ct "github.com/google/certificate-transparency-go"
 	"github.com/d-Rickyy-b/certstream-server-go/internal/certificatetransparency"
+	ct "github.com/google/certificate-transparency-go"
 	"golang.org/x/crypto/cryptobyte"
 	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
 	"golang.org/x/net/publicsuffix"
 )
 
 var (
-	oidExtSAN    = asn1.ObjectIdentifier{2, 5, 29, 17}
-	oidExtSKID   = asn1.ObjectIdentifier{2, 5, 29, 14}
-	oidExtAKI    = asn1.ObjectIdentifier{2, 5, 29, 35}
-	oidExtBC     = asn1.ObjectIdentifier{2, 5, 29, 19}
-	oidExtKU     = asn1.ObjectIdentifier{2, 5, 29, 15}
-	oidExtCP     = asn1.ObjectIdentifier{2, 5, 29, 32}
-	oidExtAIA    = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}
+	oidExtSAN  = asn1.ObjectIdentifier{2, 5, 29, 17}
+	oidExtSKID = asn1.ObjectIdentifier{2, 5, 29, 14}
+	oidExtAKI  = asn1.ObjectIdentifier{2, 5, 29, 35}
+	oidExtBC   = asn1.ObjectIdentifier{2, 5, 29, 19}
+	oidExtKU   = asn1.ObjectIdentifier{2, 5, 29, 15}
+	oidExtCP   = asn1.ObjectIdentifier{2, 5, 29, 32}
+	oidExtAIA  = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}
 
-	oidAttrCN    = asn1.ObjectIdentifier{2, 5, 4, 3}
-	oidAttrC     = asn1.ObjectIdentifier{2, 5, 4, 6}
-	oidAttrL     = asn1.ObjectIdentifier{2, 5, 4, 7}
+	oidAttrCN     = asn1.ObjectIdentifier{2, 5, 4, 3}
+	oidAttrC      = asn1.ObjectIdentifier{2, 5, 4, 6}
+	oidAttrL      = asn1.ObjectIdentifier{2, 5, 4, 7}
 	oidAttrStreet = asn1.ObjectIdentifier{2, 5, 4, 9}
-	oidAttrO     = asn1.ObjectIdentifier{2, 5, 4, 10}
-	oidAttrOU    = asn1.ObjectIdentifier{2, 5, 4, 11}
+	oidAttrO      = asn1.ObjectIdentifier{2, 5, 4, 10}
+	oidAttrOU     = asn1.ObjectIdentifier{2, 5, 4, 11}
 
 	oidAIAOCSP      = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1}
 	oidAIACaIssuers = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 2}
@@ -82,7 +82,7 @@ type fastFields struct {
 	sanIP    []string
 
 	subjectC, subjectL, subjectO, subjectOU, subjectST []string
-	subjectCN string
+	subjectCN                                          string
 
 	serial    string
 	notBefore int64
@@ -90,7 +90,8 @@ type fastFields struct {
 	sigAlg    string
 
 	aia, aki, bc, cp, ku, san, skid string
-	isCA                           bool
+	issuer                          string
+	isCA                            bool
 }
 
 // colonHexUpper formats bytes as "AA:BB:..." (hash format used upstream).
@@ -239,6 +240,63 @@ func walkName(rdns cryptobyte.String, f *fastFields) {
 			}
 		}
 	}
+}
+
+// walkIssuerName renders an RDNSequence into the same "/K=V" aggregated
+// DN form buildSubject produces for the leaf subject. CN is emitted
+// unconditionally, matching the upstream parser.
+func walkIssuerName(rdns cryptobyte.String) string {
+	var cn string
+	var c, l, o, ou, st []string
+	for !rdns.Empty() {
+		var rdn cryptobyte.String
+		if !rdns.ReadASN1(&rdn, cbasn1.SET) {
+			break
+		}
+		for !rdn.Empty() {
+			var atav cryptobyte.String
+			if !rdn.ReadASN1(&atav, cbasn1.SEQUENCE) {
+				break
+			}
+			var oid asn1.ObjectIdentifier
+			if !atav.ReadASN1ObjectIdentifier(&oid) {
+				break
+			}
+			val := readStringValue(&atav)
+			switch {
+			case oid.Equal(oidAttrCN):
+				cn = val
+			case oid.Equal(oidAttrC):
+				c = append(c, val)
+			case oid.Equal(oidAttrL):
+				l = append(l, val)
+			case oid.Equal(oidAttrO):
+				o = append(o, val)
+			case oid.Equal(oidAttrOU):
+				ou = append(ou, val)
+			case oid.Equal(oidAttrStreet):
+				st = append(st, val)
+			}
+		}
+	}
+	var b strings.Builder
+	if len(c) > 0 {
+		b.WriteString("/C=" + joinVals(c))
+	}
+	b.WriteString("/CN=" + cn)
+	if len(l) > 0 {
+		b.WriteString("/L=" + joinVals(l))
+	}
+	if len(o) > 0 {
+		b.WriteString("/O=" + joinVals(o))
+	}
+	if len(ou) > 0 {
+		b.WriteString("/OU=" + joinVals(ou))
+	}
+	if len(st) > 0 {
+		b.WriteString("/ST=" + joinVals(st))
+	}
+	return b.String()
 }
 
 // joinVals joins multi-valued name attributes the way parseName does (comma).
@@ -507,11 +565,12 @@ func walkTBS(tbs cryptobyte.String, f *fastFields, sigAlgOverride string) error 
 	if sigAlgOverride != "" {
 		f.sigAlg = sigAlgOverride
 	}
-	// issuer Name - not stored, skip
+	// issuer Name - stored as aggregated "/K=V" DN like the parser emits
 	var issuer cryptobyte.String
 	if !inner.ReadASN1(&issuer, cbasn1.SEQUENCE) {
 		return fmt.Errorf("tbs: missing issuer")
 	}
+	f.issuer = walkIssuerName(issuer)
 	// validity SEQUENCE { notBefore Time, notAfter Time }
 	var validity cryptobyte.String
 	if !inner.ReadASN1(&validity, cbasn1.SEQUENCE) {
@@ -733,34 +792,35 @@ func fastRow(rawLogEntry *ct.RawLogEntry, isPrecert bool, certIndex int64, ctURL
 	}
 
 	return &CertificateRow{
-		CertIndex:                    certIndex,
-		CertLink:                     certLink,
-		Domain:                       domain,
-		Hostnames:                    string(hostnamesJSON),
-		TLD:                          tld,
-		RootDomain:                   rootDomain,
-		Fingerprint:                  fingerprint,
-		NotAfter:                     f.notAfter,
-		NotBefore:                    f.notBefore,
-		SerialNumber:                 f.serial,
-		C:                            joinVals(f.subjectC),
-		CN:                           cn,
-		L:                            joinVals(f.subjectL),
-		O:                            joinVals(f.subjectO),
-		OU:                           joinVals(f.subjectOU),
-		ST:                           joinVals(f.subjectST),
-		Aggregated:                   agg.String(),
-		EmailAddress:                 "",
-		AuthorityInfoAccess:          f.aia,
-		AuthorityKeyIdentifier:       f.aki,
-		BasicConstraints:             f.bc,
-		CertificatePolicies:          f.cp,
+		CertIndex:                     certIndex,
+		CertLink:                      certLink,
+		Domain:                        domain,
+		Hostnames:                     string(hostnamesJSON),
+		TLD:                           tld,
+		RootDomain:                    rootDomain,
+		Fingerprint:                   fingerprint,
+		NotAfter:                      f.notAfter,
+		NotBefore:                     f.notBefore,
+		SerialNumber:                  f.serial,
+		C:                             joinVals(f.subjectC),
+		CN:                            cn,
+		L:                             joinVals(f.subjectL),
+		O:                             joinVals(f.subjectO),
+		OU:                            joinVals(f.subjectOU),
+		ST:                            joinVals(f.subjectST),
+		Aggregated:                    agg.String(),
+		EmailAddress:                  "",
+		AuthorityInfoAccess:           f.aia,
+		AuthorityKeyIdentifier:        f.aki,
+		BasicConstraints:              f.bc,
+		CertificatePolicies:           f.cp,
 		CtlSignedCertificateTimestamp: "",
-		ExtendedKeyUsage:             "",
-		KeyUsage:                     f.ku,
-		SubjectAltName:               f.san,
-		SubjectKeyIdentifier:         f.skid,
-		SignatureAlgorithm:           f.sigAlg,
+		ExtendedKeyUsage:              "",
+		KeyUsage:                      f.ku,
+		SubjectAltName:                f.san,
+		SubjectKeyIdentifier:          f.skid,
+		SignatureAlgorithm:            f.sigAlg,
+		Issuer:                        f.issuer,
 	}, nil
 }
 
