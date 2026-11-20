@@ -276,6 +276,16 @@ func parseQuery(q string) parsed {
 		}
 		return parsed{`positionCaseInsensitive(issuer, ?) > 0`, []any{v},
 			"issuer", false, false, "", nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "eku:"):
+		// extended_key_usage purpose filter - substring match on the
+		// comma-separated EKU list ("serverAuth, clientAuth"). Rows
+		// predating the parser change carry '' and are unreachable.
+		v := strings.TrimSpace(q[4:])
+		if v == "" {
+			return parsed{`1 = 0`, nil, "extended key usage", true, false, "", nil, "", nil, "", nil}
+		}
+		return parsed{`positionCaseInsensitive(extended_key_usage, ?) > 0`, []any{v},
+			"extended key usage", false, false, "", nil, "", nil, "", nil}
 	case strings.HasPrefix(low, "aki:"):
 		// authority_key_identifier: the signing CA's key id. Accepts hex
 		// with or without "keyid:"/colons, normalized to the stored
@@ -544,7 +554,7 @@ vertical-align:-2px;margin-right:.4em}
 %.example.com = subdomains &nbsp;&middot;&nbsp; example.com = name + subdomains &nbsp;&middot;&nbsp;
 % and * wildcards anywhere (foo%, %brand%) &nbsp;&middot;&nbsp;
 names:&lt;filter&gt; = distinct names &nbsp;&middot;&nbsp; domain:&lt;d&gt; = root_domain field &nbsp;&middot;&nbsp; issuer:&lt;ca&gt; &nbsp;&middot;&nbsp;
-aki:/ski:&lt;hex&gt; = key ids &nbsp;&middot;&nbsp;
+aki:/ski:&lt;hex&gt; = key ids &nbsp;&middot;&nbsp; eku:&lt;purpose&gt; &nbsp;&middot;&nbsp;
 fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt; &middot; <a href="ca">ca-issuers</a> &middot; <a href="stats">stats</a> &middot; <a href="openapi.yaml">api</a>
 </p>
 <script>
@@ -608,11 +618,12 @@ var rowTpl = template.Must(template.New("row").Funcs(
 // newest cert_index carrying it (linked to the cert page) and how many
 // SAN rows that name appears in.
 type nameRow struct {
-	Domain  string
-	Index   uint64
-	Count   uint64
-	Example string   // dedup mode: one folded name behind this eTLD+1
-	Hl      []string // literal fragments to <mark> in Domain/Example
+	Domain    string
+	Index     uint64
+	Count     uint64
+	FirstSeen time.Time // earliest insert carrying this name
+	Example   string    // dedup mode: one folded name behind this eTLD+1
+	Hl        []string  // literal fragments to <mark> in Domain/Example
 }
 
 var nameRowTpl = template.Must(template.New("nrow").Funcs(
@@ -620,6 +631,7 @@ var nameRowTpl = template.Must(template.New("nrow").Funcs(
 <td>{{hl .Domain .Hl}}{{if .Example}} <span class="hint">(e.g. {{hl .Example .Hl}})</span>{{end}}</td>
 <td class="idx"><a href="cert/{{.Index}}">{{.Index}}</a></td>
 <td>{{.Count}}</td>
+<td class="hint">{{.FirstSeen.Format "2006-01-02"}}</td>
 </tr>`))
 
 var footTpl = template.Must(template.New("foot").Funcs(
@@ -799,7 +811,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 			exCol = `, argMax(domain, cert_index) AS ex`
 		}
 		nr, err := chConn.Query(qctx,
-			`SELECT `+groupCol+` AS domain, max(cert_index) AS mi, count() AS c`+exCol+`
+			`SELECT `+groupCol+` AS domain, max(cert_index) AS mi, count() AS c, min(timestamp) AS first_seen`+exCol+`
 			 FROM `+flagDBOr()+`.`+flagTableOr()+`
 			 WHERE `+nwhere+`
 			 GROUP BY `+groupCol+`
@@ -818,9 +830,9 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 			var v nameRow
 			var err error
 			if dedup {
-				err = nr.Scan(&v.Domain, &v.Index, &v.Count, &v.Example)
+				err = nr.Scan(&v.Domain, &v.Index, &v.Count, &v.FirstSeen, &v.Example)
 			} else {
-				err = nr.Scan(&v.Domain, &v.Index, &v.Count)
+				err = nr.Scan(&v.Domain, &v.Index, &v.Count, &v.FirstSeen)
 			}
 			if err != nil {
 				qErr = "scan: " + err.Error()
@@ -1084,7 +1096,7 @@ func searchShell(w http.ResponseWriter, r *http.Request) {
 	header := `<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>` +
 		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th><th>issuer</th></tr>"
 	if pq.names {
-		header = `<tr><th>name</th><th>latest cert_index</th><th>rows</th></tr>`
+		header = `<tr><th>name</th><th>latest cert_index</th><th>rows</th><th>first seen</th></tr>`
 	}
 	io.WriteString(w, `<div id="ld"><span class="spin"></span>`+
 		`querying clickhouse&hellip; <span id="elt">0.0</span>s`+
@@ -1171,7 +1183,7 @@ func searchInline(w http.ResponseWriter, r *http.Request) {
 	header := `<tr><th>cert_index</th><th>seen</th><th>not_before</th><th>not_after</th>` +
 		"<th>cn</th><th>names</th><th>serial</th><th>subject O</th><th>issuer</th></tr>"
 	if pq.names {
-		header = `<tr><th>name</th><th>latest cert_index</th><th>rows</th></tr>`
+		header = `<tr><th>name</th><th>latest cert_index</th><th>rows</th><th>first seen</th></tr>`
 	}
 	io.WriteString(w, `<div class="tw"><table>`+"\n"+header+"\n")
 	if fl != nil {
@@ -1277,8 +1289,10 @@ func searchJSON(w http.ResponseWriter, r *http.Request) {
 				Domain    string `json:"domain"`
 				CertIndex uint64 `json:"cert_index"`
 				Count     uint64 `json:"count"`
+				FirstSeen string `json:"first_seen"`
 				Example   string `json:"example,omitempty"`
-			}{"name", nr.Domain, nr.Index, nr.Count, nr.Example})
+			}{"name", nr.Domain, nr.Index, nr.Count,
+				nr.FirstSeen.UTC().Format(time.RFC3339), nr.Example})
 		},
 		func(s string) { wr(map[string]string{"type": "status", "msg": s}) })
 

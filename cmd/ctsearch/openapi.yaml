@@ -66,7 +66,7 @@ paths:
         `{"type":"row","cert_index":..,"seen":..,"not_before":..,
         "not_after":..,"cn":..,"domain":..,"serial_number":..,"o":..,
         "hostnames":[..]}` per cert, `{"type":"name","domain":..,
-        "cert_index":..,"count":..,"example":..}` per `names:` row,
+        "cert_index":..,"count":..,"first_seen":..,"example":..}` per `names:` row,
         `{"type":"error","msg":..}` on failure, and a terminating
         `{"type":"end","kind":..,"count":..,"truncated":..,
         "next_after":..,"next_afterd":..,"elapsed_ms":..}`.
@@ -92,6 +92,7 @@ paths:
         | `issuer:<ca>` | case-insensitive substring on the issuer DN (`/C=US/O=.../CN=...`) | `issuer` column scan - rows without a recorded issuer (pre-column, CA never logged) are unreachable |
         | `aki:<hex>` | authority_key_identifier exact match - the signing CA's key id | `authority_key_identifier` column scan - input is normalized to `keyid:aa:bb:` form, so `aki:90:77:92:...`, `aki:907792...` and `aki:keyid:90:77:92:...` are equivalent |
         | `ski:<hex>` | subject_key_identifier exact match - the cert's own key id | `subject_key_identifier` column scan - same normalization as `aki:` |
+        | `eku:<purpose>` | extended key usage - case-insensitive substring on the comma-separated EKU list (`serverAuth`, `clientAuth`, `codeSigning`, `emailProtection`, `timeStamping`, `OCSPSigning`, ...) | `extended_key_usage` column scan - rows predating the parser fix carry '' |
 
         **Pagination.** Row searches return at most `-limit` rows; when
         more exist the footer (`end` event / page footer) links
@@ -355,6 +356,7 @@ components:
         domain:    { type: string }
         cert_index: { type: integer, format: uint64, description: newest cert carrying the name }
         count:      { type: integer, format: uint64, description: SAN rows containing the name }
+        first_seen: { type: string, format: date-time, description: earliest insert carrying the name }
         example:    { type: string, description: "dedup only: one folded name from the newest cert in the group (argMax(domain, cert_index)); empty when it equals domain" }
     CaIssuer:
       type: object

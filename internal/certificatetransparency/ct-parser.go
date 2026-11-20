@@ -266,6 +266,16 @@ func leafCertFromX509cert(cert x509.Certificate, withDER bool, hashData []byte) 
 
 			policyString := builder.String()
 			leafCert.Extensions.CertificatePolicies = &policyString
+		case extension.Id.Equal(x509.OIDExtensionExtendedKeyUsage):
+			var buf bytes.Buffer
+			for _, eku := range cert.ExtKeyUsage {
+				commaAppend(&buf, extKeyUsageName(eku))
+			}
+			for _, oid := range cert.UnknownExtKeyUsage {
+				commaAppend(&buf, oid.String())
+			}
+			eku := buf.String()
+			leafCert.Extensions.ExtendedKeyUsage = &eku
 		}
 	}
 
@@ -434,6 +444,42 @@ func commaAppend(buf *bytes.Buffer, s string) {
 	}
 
 	buf.WriteString(s)
+}
+
+// extKeyUsageName renders an ExtKeyUsage enum value as the short OID
+// name used by crt.sh-style purpose filters (serverAuth, clientAuth, ...).
+func extKeyUsageName(k x509.ExtKeyUsage) string {
+	switch k {
+	case x509.ExtKeyUsageAny:
+		return "any"
+	case x509.ExtKeyUsageServerAuth:
+		return "serverAuth"
+	case x509.ExtKeyUsageClientAuth:
+		return "clientAuth"
+	case x509.ExtKeyUsageCodeSigning:
+		return "codeSigning"
+	case x509.ExtKeyUsageEmailProtection:
+		return "emailProtection"
+	case x509.ExtKeyUsageIPSECEndSystem:
+		return "ipsecEndSystem"
+	case x509.ExtKeyUsageIPSECTunnel:
+		return "ipsecTunnel"
+	case x509.ExtKeyUsageIPSECUser:
+		return "ipsecUser"
+	case x509.ExtKeyUsageTimeStamping:
+		return "timeStamping"
+	case x509.ExtKeyUsageOCSPSigning:
+		return "OCSPSigning"
+	case x509.ExtKeyUsageMicrosoftServerGatedCrypto:
+		return "msSGC"
+	case x509.ExtKeyUsageNetscapeServerGatedCrypto:
+		return "nsSGC"
+	case x509.ExtKeyUsageMicrosoftCommercialCodeSigning:
+		return "msComCodeSigning"
+	case x509.ExtKeyUsageMicrosoftKernelCodeSigning:
+		return "msKernelCodeSigning"
+	}
+	return "unknown"
 }
 
 func keyUsageToString(k x509.KeyUsage) string {
