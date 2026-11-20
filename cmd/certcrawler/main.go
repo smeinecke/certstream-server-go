@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -467,6 +469,109 @@ func fetchWithRetry(ctx context.Context, jsonClient *client.LogClient, limiter *
 // an unbounded burst exhausts the driver conn pool (acquire conn timeout)
 var insertSem = make(chan struct{}, 24)
 
+// dedupKey collapses precert/leaf pairs and multi-log copies of the same
+// cert: serial_number is unique per issuing key (authority_key_identifier),
+// and issuer guards CAs that log entries without AKI data. The digest must
+// match ClickHouse's MD5() output - that is what the seen_certs seed used.
+func dedupKey(r *CertificateRow) string {
+	sum := md5.Sum([]byte(r.SerialNumber + "|" + r.AuthorityKeyIdentifier + "|" + r.Issuer))
+	return hex.EncodeToString(sum[:])
+}
+
+// dedupChunk bounds each h IN (...) lookup - each unhex('<64 hex>') literal
+// is ~74 bytes, so 3000 keys (~220KiB) stays under ClickHouse's default
+// max_query_size (256KiB).
+const dedupChunk = 3000
+
+// filterSeen drops rows whose dedup key is already in certstream.seen_certs
+// and returns the surviving rows plus their dedup keys. On lookup failure it
+// warns and passes everything through - a rare dupe beats a dropped cert.
+// When chConn is nil (dry runs) it is a no-op.
+func filterSeen(ctx context.Context, chConn clickhouse.Conn, db string, rows []CertificateRow) ([]CertificateRow, []string) {
+	if chConn == nil || len(rows) == 0 {
+		return rows, nil
+	}
+	// local dedup first: the same cert lands in several logs within
+	// seconds, so copies frequently share one batch.
+	local := map[string]bool{}
+	keys := make([]string, 0, len(rows))
+	uniq := rows[:0]
+	for i := range rows {
+		k := dedupKey(&rows[i])
+		if local[k] {
+			continue
+		}
+		local[k] = true
+		uniq = append(uniq, rows[i])
+		keys = append(keys, k)
+	}
+	known := map[string]bool{}
+	lookupFailed := false
+	for start := 0; start < len(keys); start += dedupChunk {
+		end := start + dedupChunk
+		if end > len(keys) {
+			end = len(keys)
+		}
+		var sb strings.Builder
+		for _, k := range keys[start:end] {
+			sb.WriteString("unhex('")
+			sb.WriteString(k)
+			sb.WriteString("'),")
+		}
+		in := strings.TrimSuffix(sb.String(), ",")
+		q := fmt.Sprintf("SELECT lower(hex(h)) FROM %s.seen_certs WHERE h IN (%s)", db, in)
+		rrows, err := chConn.Query(ctx, q)
+		if err != nil {
+			log.Printf("seen_certs lookup failed, inserting unfiltered: %v", err)
+			lookupFailed = true
+			break
+		}
+		for rrows.Next() {
+			var h string
+			if rrows.Scan(&h) == nil {
+				known[h] = true
+			}
+		}
+		rrows.Close()
+	}
+	if lookupFailed {
+		// still locally deduped - all keys are fresh so they get recorded
+		return uniq, keys
+	}
+	var out []CertificateRow
+	fresh := keys[:0]
+	for i := range uniq {
+		if known[keys[i]] {
+			continue
+		}
+		out = append(out, uniq[i])
+		fresh = append(fresh, keys[i])
+	}
+	return out, fresh
+}
+
+// recordSeen inserts dedup keys of freshly stored rows so later copies from
+// other logs are skipped. Failures only risk a stray duplicate later.
+func recordSeen(ctx context.Context, chConn clickhouse.Conn, db string, keys []string) {
+	for start := 0; start < len(keys); start += dedupChunk {
+		end := start + dedupChunk
+		if end > len(keys) {
+			end = len(keys)
+		}
+		var sb strings.Builder
+		for _, k := range keys[start:end] {
+			sb.WriteString("unhex('")
+			sb.WriteString(k)
+			sb.WriteString("'),")
+		}
+		in := strings.TrimSuffix(sb.String(), ",")
+		q := fmt.Sprintf("INSERT INTO %s.seen_certs SELECT arrayJoin([%s])", db, in)
+		if err := chConn.Exec(ctx, q); err != nil {
+			log.Printf("seen_certs insert failed: %v", err)
+		}
+	}
+}
+
 func insertWithRetry(ctx context.Context, chConn clickhouse.Conn, db, table string, rows []CertificateRow, st *stats, group interval) error {
 	select {
 	case insertSem <- struct{}{}:
@@ -757,6 +862,12 @@ func processGroup(ctx context.Context, g interval, jsonClient *client.LogClient,
 
 	// single insert per group - atomic, so the group is all-or-nothing
 	if len(rows) > 0 && chConn != nil {
+		rows, freshKeys := filterSeen(ctx, chConn, *flagCHDB, rows)
+		if len(rows) == 0 {
+			res.lines = lines
+			res.done = []interval{g}
+			return res
+		}
 		if err := insertWithRetry(ctx, chConn, *flagCHDB, *flagCHTable, rows, st, g); err != nil {
 			if ctx.Err() != nil {
 				res.aborted = true
@@ -771,6 +882,7 @@ func processGroup(ctx context.Context, g interval, jsonClient *client.LogClient,
 		}
 		res.inserted = len(rows)
 		st.inserted.Add(int64(len(rows)))
+		recordSeen(ctx, chConn, *flagCHDB, freshKeys)
 	}
 	res.lines = lines
 	// done = group minus failed sub-ranges
