@@ -1407,11 +1407,14 @@ func caHandler(w http.ResponseWriter, r *http.Request) {
 	qctx, qcancel := context.WithTimeout(r.Context(), *flagQTimeout)
 	defer qcancel()
 	rows, err := chConn.Query(qctx,
+		// issuer_stats holds one delta row per refresh batch - GROUP BY
+		// name folds them into per-issuer totals.
 		`SELECT s.name, ifNull(i.aki, ''), ifNull(i.url, ''),
-		        s.leafs, s.first_seen, s.last_seen
+		        sum(s.leafs), min(s.first_seen), max(s.last_seen)
 		 FROM `+flagDBOr()+`.issuer_stats s
 		 LEFT JOIN `+flagDBOr()+`.issuers i ON i.name = s.name
-		 ORDER BY s.leafs DESC`)
+		 GROUP BY s.name, i.aki, i.url
+		 ORDER BY sum(s.leafs) DESC`)
 	if err != nil {
 		http.Error(w, "query: "+err.Error(), 500)
 		return
@@ -1513,14 +1516,15 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 			st.IngestPerMin = probe / st.LastSeen.Sub(boundary).Minutes()
 		}
 	}
-	one(`SELECT count(), sum(leafs) FROM `+flagDBOr()+`.issuer_stats`,
+	one(`SELECT uniq(name), sum(leafs) FROM `+flagDBOr()+`.issuer_stats`,
 		[]any{&st.IssuerDNs, &st.IssuedLeafs})
 	if st.TotalCerts > 0 {
 		st.IssuerCover = float64(st.IssuedLeafs) / float64(st.TotalCerts) * 100
 	}
 	rows, err := chConn.Query(qctx,
-		`SELECT name, leafs, first_seen, last_seen FROM `+flagDBOr()+`.issuer_stats
-		 ORDER BY leafs DESC LIMIT 10`)
+		`SELECT name, sum(leafs), min(first_seen), max(last_seen)
+		 FROM `+flagDBOr()+`.issuer_stats
+		 GROUP BY name ORDER BY sum(leafs) DESC LIMIT 10`)
 	if err == nil {
 		for rows.Next() {
 			var c caRow
@@ -1555,7 +1559,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 			url.QueryEscape(issuerCN(c.Name)), template.HTMLEscapeString(c.Name),
 			c.Leafs, c.FirstSeen.Format("2006-01-02"), c.LastSeen.Format("2006-01-02"))
 	}
-	io.WriteString(w, `</table></div><p class="hint">issuer coverage counts are refreshed by a manual GROUP BY, not live.</p></body></html>`)
+	io.WriteString(w, `</table></div><p class="hint">issuer coverage refreshes hourly via issuer-stats-refresh.timer.</p></body></html>`)
 }
 
 func wantsJSON(r *http.Request) bool {
