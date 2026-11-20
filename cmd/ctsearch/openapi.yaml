@@ -93,6 +93,23 @@ paths:
         | `aki:<hex>` | authority_key_identifier exact match - the signing CA's key id | `authority_key_identifier` column scan - input is normalized to `keyid:aa:bb:` form, so `aki:90:77:92:...`, `aki:907792...` and `aki:keyid:90:77:92:...` are equivalent |
         | `ski:<hex>` | subject_key_identifier exact match - the cert's own key id | `subject_key_identifier` column scan - same normalization as `aki:` |
         | `eku:<purpose>` | extended key usage - case-insensitive substring on the comma-separated EKU list (`serverAuth`, `clientAuth`, `codeSigning`, `emailProtection`, `timeStamping`, `OCSPSigning`, ...) | `extended_key_usage` column scan - rows predating the parser fix carry '' |
+        | `c:<cc>` | subject country, exact (any case) | `c` column scan |
+        | `o:/ou:/st:/l:<text>` | subject DN component, case-insensitive substring | column scan |
+        | `ca:` / `ca:0` | CA certs only / leaf-only | `basic_constraints` scan |
+        | `selfsigned:` | issuer DN = subject DN (`issuer = aggregated`) | column scan |
+        | `wildcard:` | SAN names starting with `*` | `domain` scan (narrow via `certs_idx`) |
+        | `valid:` | `not_before <= now <= not_after` (unlike `noexp` also drops not-yet-valid) | column scan |
+        | `exp<|><n><d|h|w>` / `nb<|><n><d|h|w>` | validity window - `exp<30d` expires within 30 days, `nb<7d` issued within 7 days; bare int = epoch | `not_after`/`not_before` scan |
+
+        **Compound queries.** Space-separated terms AND together:
+        `example.com issuer:encrypt eku:serverAuth exp<30d`. Domain
+        terms supply the index path (multi-domain = `cert_index` set
+        intersection) and result rows show SANs matching any domain
+        term; other prefixes filter at cert level. Values with spaces
+        need double quotes (`issuer:"Let's Encrypt"`), though
+        issuer:/o:/ou:/st:/l:/cn: auto-extend over following bare words
+        that contain no `.` or `:`. `names:` swallows its remainder and
+        cannot be combined.
 
         **Pagination.** Row searches return at most `-limit` rows; when
         more exist the footer (`end` event / page footer) links

@@ -65,8 +65,9 @@ type row struct {
 }
 
 type formData struct {
-	Query, Base  string
-	Dedup, Noexp bool
+	Query, Base string
+	Dedup       string
+	Noexp       bool
 }
 
 type resultPage struct {
@@ -238,6 +239,29 @@ func parseQuery(q string) parsed {
 	q = strings.TrimSpace(q)
 	low := strings.ToLower(q)
 
+	// names: swallows its whole remainder as a sub-filter - it cannot
+	// compound with siblings, so check it before term splitting.
+	if strings.HasPrefix(low, "names:") {
+		return namesQuery(strings.TrimSpace(q[6:]))
+	}
+	// compound query: space-separated terms AND together. A domain term
+	// supplies the phase-1 index path; every term's exact predicate is
+	// re-applied in phase 2. Without this, "a.com issuer:X" was silently
+	// parsed as one giant domain literal. Values containing spaces need
+	// double quotes: issuer:"Let's Encrypt".
+	if terms := splitTerms(q); len(terms) > 1 {
+		var ps []parsed
+		for _, t := range terms {
+			p := parseQuery(t)
+			if p.names {
+				return parsed{`1 = 0`, nil, "names: cannot be combined with other terms",
+					true, false, "", nil, "", nil, "", nil}
+			}
+			ps = append(ps, p)
+		}
+		return combineParsed(ps)
+	}
+
 	switch {
 	case strings.HasPrefix(low, "fp:") || strings.HasPrefix(low, "fingerprint:"):
 		v := q[strings.Index(q, ":")+1:]
@@ -249,8 +273,6 @@ func parseQuery(q string) parsed {
 	case strings.HasPrefix(low, "idx:"):
 		n, _ := strconv.ParseUint(q[4:], 10, 64)
 		return idxPred(n)
-	case strings.HasPrefix(low, "names:"):
-		return namesQuery(strings.TrimSpace(q[6:]))
 	case strings.HasPrefix(low, "domain:"):
 		// explicit root_domain field search: matches the eTLD+1 value
 		// literally. When the input is itself a valid eTLD+1,
@@ -305,6 +327,58 @@ func parseQuery(q string) parsed {
 		}
 		return parsed{`subject_key_identifier = ?`, []any{v},
 			"subject key id", false, false, "", nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "c:"):
+		// subject country code - exact match, any case in input
+		return parsed{`upper(c) = ?`, []any{strings.ToUpper(strings.TrimSpace(q[2:]))},
+			"subject C", false, false, "", nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "o:"), strings.HasPrefix(low, "ou:"),
+		strings.HasPrefix(low, "st:"), strings.HasPrefix(low, "l:"):
+		// subject DN components - case-insensitive substring like issuer:
+		col := low[:strings.Index(low, ":")]
+		v := q[strings.Index(q, ":")+1:]
+		return parsed{`positionCaseInsensitive(` + col + `, ?) > 0`, []any{v},
+			"subject " + strings.ToUpper(col), false, false, "", nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "ca:"), low == "ca":
+		// basic_constraints CA flag - CA certs logged to CT (intermediates).
+		// ca:0 inverts to leaf-only.
+		if off := q[strings.Index(q, ":")+1:]; off == "0" || off == "false" || off == "no" {
+			return parsed{`basic_constraints != 'CA:TRUE'`, nil, "not CA", false, false, "", nil, "", nil, "", nil}
+		}
+		return parsed{`basic_constraints = 'CA:TRUE'`, nil, "CA certs", false, false, "", nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "selfsigned:"), low == "selfsigned":
+		// aggregated holds the subject DN in the same /C=../O=../CN=..
+		// slash form as issuer - equality means the cert signed itself.
+		// issuer='' means unknown, so it is excluded explicitly.
+		return parsed{`issuer != '' AND issuer = aggregated`, nil,
+			"self-signed", false, false, "", nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "wildcard:"), low == "wildcard":
+		// SAN names literally starting with '*' - LIKE '*' is a literal
+		// char in ClickHouse patterns, only %/_ are wildcards. p1where
+		// lets the same predicate scan the narrow certs_idx table.
+		return parsed{`domain LIKE '*%'`, nil, "wildcard names", false, false,
+			`domain LIKE '*%'`, nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "valid:"), low == "valid":
+		// valid right now: not_before <= t <= not_after. Unlike noexp this
+		// also drops certs not yet valid.
+		now := uint64(time.Now().Unix())
+		return parsed{`not_before <= ? AND not_after >= ?`, []any{now, now},
+			"currently valid", false, false, "", nil, "", nil, "", nil}
+	case strings.HasPrefix(low, "exp<"), strings.HasPrefix(low, "exp>"),
+		strings.HasPrefix(low, "nb<"), strings.HasPrefix(low, "nb>"):
+		// validity-window filters. exp<n>d = expires within n days,
+		// exp>n>d = expires more than n days out, nb<n>d = issued within
+		// n days. Bare integer values compare as epoch seconds.
+		col := "not_after"
+		rest := q[3:] // exp is 3 chars, keep the < /> operator for timeSpec
+		if low[1] == 'b' {
+			col, rest = "not_before", q[2:]
+		}
+		op, ts, ok := timeSpec(rest)
+		if !ok {
+			return parsed{`1 = 0`, nil, col + " filter", true, false, "", nil, "", nil, "", nil}
+		}
+		return parsed{col + ` ` + op + ` ?`, []any{ts}, col + " " + op + " " + rest[1:],
+			false, false, "", nil, "", nil, "", nil}
 	}
 
 	if n, err := strconv.ParseUint(q, 10, 64); err == nil {
@@ -367,6 +441,163 @@ func parseQuery(q string) parsed {
 	dw, da := domScope(low)
 	return parsed{`root_domain = ?`, []any{low}, "domain + subdomains", false, false, "", nil,
 		dw, da, `domain = ? OR endsWith(domain, ?)`, []any{low, "." + low}}
+}
+
+// splitTerms tokenizes a compound query on whitespace, honoring double
+// quotes for values containing spaces (issuer:"Let's Encrypt"). Quotes
+// are stripped. After free-text prefixes (issuer:/o:/cn:/...) bare
+// following words join the value - "issuer:Let's Encrypt" is one term -
+// while tokens containing '.' or ':' start a new term.
+func splitTerms(q string) []string {
+	var raw []string
+	var cur strings.Builder
+	inQ := false
+	flush := func() {
+		if cur.Len() > 0 {
+			raw = append(raw, cur.String())
+			cur.Reset()
+		}
+	}
+	for _, r := range q {
+		switch {
+		case r == '"':
+			inQ = !inQ
+		case (r == ' ' || r == '\t') && !inQ:
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
+
+	freeText := map[string]bool{
+		"issuer:": true, "o:": true, "ou:": true,
+		"st:": true, "l:": true, "cn:": true,
+	}
+	var out []string
+	for i := 0; i < len(raw); i++ {
+		t := raw[i]
+		if idx := strings.Index(t, ":"); idx > 0 && freeText[strings.ToLower(t[:idx+1])] {
+			for i+1 < len(raw) && !strings.ContainsAny(raw[i+1], ".:") {
+				t += " " + raw[i+1]
+				i++
+			}
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// combineParsed merges individually parsed terms into one compound
+// query. Terms split into two groups:
+//
+//   - domain terms (any domain/dom/p1/p2 predicate): "certs covering
+//     these names" - display SAN rows matching ANY of them (OR), and
+//     phase 1 intersects their cert_index sets via IN subqueries.
+//   - other terms (issuer/aki/exp/...): cert-level filters ANDed onto
+//     both display rows and the phase-1 set (single-flagged ones only
+//     join phase 1 via a bounded IN subquery - an issuer: IN would
+//     materialize hundreds of millions of indexes).
+func combineParsed(ts []parsed) parsed {
+	var domExact, other, doms, p1s, kinds []string
+	var args, doma, p1a []any
+	single := false
+	for _, t := range ts {
+		kinds = append(kinds, t.kind)
+		single = single || t.single // one selective term bounds the intersection
+		w, wa := t.where, t.args
+		if t.p2where != "" {
+			w, wa = t.p2where, t.p2args
+		}
+		isDom := t.domwhere != "" || t.p1where != "" || t.p2where != ""
+		if isDom {
+			domExact = append(domExact, "("+w+")")
+		} else {
+			other = append(other, "("+w+")")
+		}
+		args = append(args, wa...)
+		// phase-1 candidates: domwhere, or p1where rewritten for the
+		// dom table (certs_idx's domain column exists on certs_dom too)
+		dw, da := t.domwhere, t.domargs
+		if dw == "" {
+			dw, da = t.p1where, t.p1args
+		}
+		if dw != "" {
+			doms = append(doms, "("+dw+")")
+			doma = append(doma, da...)
+		}
+		if t.p1where != "" {
+			p1s = append(p1s, "("+t.p1where+")")
+			p1a = append(p1a, t.p1args...)
+		}
+	}
+	// phase-2 predicate: SAN rows match any domain term, every other term
+	var ws []string
+	if len(domExact) > 0 {
+		ws = append(ws, "("+strings.Join(domExact, " OR ")+")")
+	}
+	ws = append(ws, other...)
+	return parsed{
+		strings.Join(ws, " AND "), args, strings.Join(kinds, " + "),
+		single, false,
+		intersectIdx(p1s, p1a, flagIdxOr()),
+		append([]any{}, p1a...),
+		intersectIdx(doms, doma, flagDomOr()),
+		append([]any{}, doma...),
+		"", nil,
+	}
+}
+
+// intersectIdx builds a phase-1 predicate from per-term predicates on a
+// narrow lookup table (certs_dom or certs_idx). One term is a plain
+// AND; several become "first term AND cert_index IN (SELECT ... rest)"
+// so each extra term intersects the cert set rather than asking one row
+// to match several domain predicates at once.
+func intersectIdx(preds []string, args []any, tbl string) string {
+	switch len(preds) {
+	case 0:
+		return ""
+	case 1:
+		return preds[0]
+	}
+	if tbl == "" {
+		return preds[0]
+	}
+	var sb strings.Builder
+	sb.WriteString(preds[0])
+	for _, p := range preds[1:] {
+		sb.WriteString(` AND cert_index IN (SELECT cert_index FROM ` + tbl + ` WHERE ` + p + `)`)
+	}
+	return sb.String()
+}
+
+// timeSpec parses "<30d"/">1735000000" style values for exp/nb filters.
+// Returns the comparison operator and an epoch seconds bound: duration
+// suffixes (d/h/w) are relative to now, bare ints are absolute epochs.
+func timeSpec(rest string) (op string, ts uint64, ok bool) {
+	if len(rest) < 2 || (rest[0] != '<' && rest[0] != '>') {
+		return "", 0, false
+	}
+	op, val := string(rest[0]), rest[1:]
+	mult := uint64(1)
+	if len(val) > 0 {
+		switch val[len(val)-1] {
+		case 'd':
+			mult, val = 86400, val[:len(val)-1]
+		case 'h':
+			mult, val = 3600, val[:len(val)-1]
+		case 'w':
+			mult, val = 604800, val[:len(val)-1]
+		}
+	}
+	n, err := strconv.ParseUint(val, 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	if mult > 1 {
+		return op, uint64(time.Now().Unix()) + n*mult, true
+	}
+	return op, n, true
 }
 
 // idxPred builds the cert_index predicate. With the certs_idx lookup
@@ -541,22 +772,57 @@ td.idx{white-space:nowrap}
 border-top-color:#222;border-radius:50%;animation:sp .8s linear infinite;
 vertical-align:-2px;margin-right:.4em}
 @keyframes sp{to{transform:rotate(360deg)}}
+#help{display:none}
+#help:target{display:block;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9}
+#help .box{max-width:640px;margin:8vh auto;background:#fff;border:1px solid #666;
+padding:1em 1.4em;max-height:80vh;overflow-y:auto;box-shadow:0 4px 18px #0005}
+#help h4{margin:.2em 0 .6em}
+#help table{border-collapse:collapse}
+#help td{border:0;border-bottom:1px solid #ddd;padding:2px 8px 2px 0}
+#help code{background:#eee;padding:0 3px;white-space:nowrap}
 </style>
 <base href="{{.Base}}"></head><body>
+<div id="help"><div class="box">
+<h4>query syntax <a href="#" style="float:right;text-decoration:none" title="close">&times;</a></h4>
+<table>
+<tr><td><code>example.com</code></td><td>name + all subdomains</td></tr>
+<tr><td><code>%.example.com</code></td><td>subdomains only (any depth)</td></tr>
+<tr><td><code>% / *</code></td><td>wildcards anywhere: <code>foo%</code>, <code>%brand%</code>, <code>*.foo.*</code></td></tr>
+<tr><td><code>a.com b.com</code></td><td>AND terms - certs covering both names; quote values with spaces: <code>issuer:"Let's Encrypt"</code></td></tr>
+<tr><td><code>names:&lt;filter&gt;</code></td><td>distinct names matching a domain filter</td></tr>
+<tr><td><code>domain:&lt;d&gt;</code></td><td>match the root_domain field (eTLD+1)</td></tr>
+<tr><td><code>issuer:&lt;ca&gt;</code></td><td>issuer DN substring (case-insensitive)</td></tr>
+<tr><td><code>aki: / ski:&lt;hex&gt;</code></td><td>authority / subject key id, any hex form</td></tr>
+<tr><td><code>eku:&lt;purpose&gt;</code></td><td>extended key usage: serverAuth, clientAuth, codeSigning, ...</td></tr>
+<tr><td><code>fp:&lt;sha256&gt;</code></td><td>fingerprint exact</td></tr>
+<tr><td><code>serial:&lt;n&gt;</code></td><td>serial number</td></tr>
+<tr><td><code>cn:&lt;name&gt;</code></td><td>subject CN exact</td></tr>
+<tr><td><code>idx:&lt;n&gt;</code> / <code>&lt;n&gt;</code></td><td>cert_index</td></tr>
+<tr><td><code>c: / o: / ou: / st: / l:</code></td><td>subject DN fields (c exact, rest substring)</td></tr>
+<tr><td><code>ca:</code></td><td>CA certs only (<code>ca:0</code> = leaf only)</td></tr>
+<tr><td><code>selfsigned:</code></td><td>issuer = subject</td></tr>
+<tr><td><code>wildcard:</code></td><td>*.names only</td></tr>
+<tr><td><code>valid:</code></td><td>not_before &le; now &le; not_after</td></tr>
+<tr><td><code>exp&lt;30d / exp&gt;90d</code></td><td>expiry window (d/h/w or epoch)</td></tr>
+<tr><td><code>nb&lt;7d / nb&gt;30d</code></td><td>not_before window, same units</td></tr>
+</table>
+<p class="hint">
+checkboxes: <b>dedup</b> folds precert/leaf pairs (and names: to eTLD+1) &middot;
+<b>hide expired</b> drops not_after &lt; now.<br>
+params: <code>output=json</code> NDJSON &middot; <code>limit=n</code> &middot;
+<code>after=/afterd=</code> cursors &middot; <code>dedup=1</code> &middot; <code>noexp=1</code><br>
+<a href="ca">ca-issuers</a> &middot; <a href="stats">stats</a> &middot; <a href="openapi.yaml">api</a>
+</p>
+</div></div>
 <h3>ct search</h3>
 <form method="get" action="search">
-<input type="text" name="q" value="{{.Query}}" autofocus placeholder="%.example.com | example.com | fp: | serial: | cn: | idx:">
+<input type="text" name="q" value="{{.Query}}" autofocus placeholder="example.com | %.example.com | issuer: | eku: | aki: | exp<30d ...">
 <input type="submit" value="Search">
-<label title="names: only - fold results to registrable domains"><input type="checkbox" name="dedup" value="1"{{if .Dedup}} checked{{end}}> domains only</label>
+<label title="row searches: collapse precert/leaf pairs &#10;names: fold to registrable domains"><input type="checkbox" name="dedup" value="1"{{if .Dedup}} checked{{end}}> dedup</label>
 <label title="hide expired certificates"><input type="checkbox" name="noexp" value="1"{{if .Noexp}} checked{{end}}> hide expired</label>
+<a href="#help" title="query syntax">[?]</a>
 </form>
-<p class="hint">
-%.example.com = subdomains &nbsp;&middot;&nbsp; example.com = name + subdomains &nbsp;&middot;&nbsp;
-% and * wildcards anywhere (foo%, %brand%) &nbsp;&middot;&nbsp;
-names:&lt;filter&gt; = distinct names &nbsp;&middot;&nbsp; domain:&lt;d&gt; = root_domain field &nbsp;&middot;&nbsp; issuer:&lt;ca&gt; &nbsp;&middot;&nbsp;
-aki:/ski:&lt;hex&gt; = key ids &nbsp;&middot;&nbsp; eku:&lt;purpose&gt; &nbsp;&middot;&nbsp;
-fp:&lt;sha256&gt; &middot; serial:&lt;n&gt; &middot; cn:&lt;name&gt; &middot; idx:&lt;n&gt; &middot; <a href="ca">ca-issuers</a> &middot; <a href="stats">stats</a> &middot; <a href="openapi.yaml">api</a>
-</p>
+<p class="hint">combine terms with spaces: <code>example.com issuer:encrypt eku:serverAuth exp&lt;30d</code></p>
 <script>
 // cursor stack for prev-page navigation - cursors are forward-only, so
 // each page's entry cursor is stashed under its page number, keyed by
@@ -573,7 +839,7 @@ try{sessionStorage.setItem(k,JSON.stringify(st))}catch(e){}
 function goPrev(){
 var u=new URL(location),q=u.searchParams.get('q'),p=parseInt(u.searchParams.get('page'))||1;
 if(p<=1)return false;
-var x='{{if .Dedup}}&dedup=1{{end}}{{if .Noexp}}&noexp=1{{end}}';
+var x='{{if .Dedup}}&dedup={{.Dedup}}{{end}}{{if .Noexp}}&noexp=1{{end}}';
 var v='search?q='+encodeURIComponent(q)+x+'&page='+(p-1);
 if(p>2){
 var c=null;
@@ -637,7 +903,7 @@ var nameRowTpl = template.Must(template.New("nrow").Funcs(
 var footTpl = template.Must(template.New("foot").Funcs(
 	template.FuncMap{"urlquery": url.QueryEscape}).Parse(`<p>{{.Kind}}: {{.Count}} row(s){{if .HaveNext}}{{if .Names}} (display cap - more exist){{else}}+ (page limit){{end}}{{end}} in {{.Elapsed}} &middot; page {{.Page}}
 {{if .PrevOK}}&nbsp; <a href="#" onclick="return goPrev()">&larr; prev</a>{{end}}
-{{if and .HaveNext (not .Names)}}&nbsp; <a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}{{if .NextDom}}&amp;afterd={{urlquery .NextDom}}{{end}}&amp;page={{.NextPage}}{{if .Dedup}}&amp;dedup=1{{end}}{{if .Noexp}}&amp;noexp=1{{end}}">next page &rarr;</a>{{end}}</p>`))
+{{if and .HaveNext (not .Names)}}&nbsp; <a href="search?q={{urlquery .Query}}&amp;after={{.NextAfter}}{{if .NextDom}}&amp;afterd={{urlquery .NextDom}}{{end}}&amp;page={{.NextPage}}{{if .Dedup}}&amp;dedup={{.Dedup}}{{end}}{{if .Noexp}}&amp;noexp=1{{end}}">next page &rarr;</a>{{end}}</p>`))
 
 var certTpl = template.Must(template.New("cert").Funcs(
 	template.FuncMap{"ts": tsFormat}).Parse(`<!DOCTYPE html>
@@ -749,11 +1015,39 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// scanSem bounds concurrent ClickHouse scans - one unbounded query can
+// saturate the box (the cas incident), so excess searches queue instead
+// of piling onto it.
+var scanSem = make(chan struct{}, 4)
+
 // runSearch executes the parsed query and calls emitRow per display
 // row; emitStatus (may be nil) reports phase progress for streamed UIs.
 // Returns the error text, row count, and pagination cursor.
-func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, dedup bool, noexp bool,
+// dedupMode: "1"/"true"/"on" folds names: to eTLD+1 and collapses
+// precert/leaf pairs in row searches, "dom" folds only names:,
+// "pre" collapses only precert/leaf pairs.
+func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, dedupMode string, noexp bool,
 	emitRow func(row), emitName func(nameRow), emitStatus func(string)) (qErr string, count int, haveNext bool, lastIdx uint64, lastDom string) {
+
+	domFold := dedupMode != "" && dedupMode != "pre"
+	preFold := dedupMode != "" && dedupMode != "dom"
+
+	select {
+	case scanSem <- struct{}{}:
+	default:
+		// at capacity - queue rather than add another scan. A second
+		// blocked select releases us on a slot or on ctx cancel.
+		if emitStatus != nil {
+			emitStatus("queued - scan slots busy")
+		}
+		select {
+		case scanSem <- struct{}{}:
+		case <-qctx.Done():
+			qErr = "query cancelled while queued"
+			return
+		}
+	}
+	defer func() { <-scanSem }()
 
 	terms := hlTerms(pq)
 	if noexp {
@@ -790,7 +1084,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 		nwhere := "(" + pq.where + ")"
 		nargs := append([]any{}, pq.args...)
 		groupCol, cursorCol := "domain", "domain"
-		if dedup {
+		if domFold {
 			// fold every name to its eTLD+1: root_domain is already the
 			// registrable domain per row, so GROUP BY root_domain is the
 			// same dedup - just done in ClickHouse instead of Go.
@@ -803,7 +1097,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 		}
 		status("aggregating distinct names")
 		exCol := ""
-		if dedup {
+		if domFold {
 			// one example of the folded names - without it a match like
 			// names:*bla* would show only bla.com and hide which
 			// subdomain actually matched. argMax picks a name from the
@@ -829,7 +1123,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 			}
 			var v nameRow
 			var err error
-			if dedup {
+			if domFold {
 				err = nr.Scan(&v.Domain, &v.Index, &v.Count, &v.FirstSeen, &v.Example)
 			} else {
 				err = nr.Scan(&v.Domain, &v.Index, &v.Count, &v.FirstSeen)
@@ -867,19 +1161,33 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 	}
 	args = append(args, *flagLimit+1)
 
-	const cols = `cert_index, timestamp, not_before, not_after, cn, domain, serial_number, o, hostnames, issuer`
+	const cols = `cert_index, timestamp, not_before, not_after, cn, domain, serial_number, o, hostnames, issuer, authority_key_identifier`
+	// dedup=pre (and dedup=1) collapses precert/leaf pairs: they share
+	// serial + signing key, so the first row per (serial, aki) wins.
+	// Best-effort across pages - siblings can straddle a page boundary.
+	var seenPair map[string]bool
+	if preFold {
+		seenPair = map[string]bool{}
+	}
 	emit := func(rows driver.Rows, capRows bool) {
 		defer rows.Close()
 		for rows.Next() {
 			var rw row
 			if err := rows.Scan(&rw.Index, &rw.Seen, &rw.NotBefore, &rw.NotAfter,
-				&rw.CN, &rw.Domain, &rw.Serial, &rw.O, &rw.Hostnames, &rw.Issuer); err != nil {
+				&rw.CN, &rw.Domain, &rw.Serial, &rw.O, &rw.Hostnames, &rw.Issuer, &rw.AKI); err != nil {
 				qErr = "scan: " + err.Error()
 				return
 			}
 			if capRows && count == *flagLimit {
 				haveNext = true // extra row only signals the next page
 				continue
+			}
+			if seenPair != nil {
+				k := rw.Serial + "|" + rw.AKI
+				if seenPair[k] {
+					continue
+				}
+				seenPair[k] = true
 			}
 			// phase-2 emits rows unsorted - the cursor must track the max
 			// index seen (with its last-seen domain for the row-level
@@ -1039,7 +1347,7 @@ func runSearch(qctx context.Context, pq parsed, after uint64, afterd string, ded
 }
 
 // searchArgs pulls the query params shared by all response modes.
-func searchArgs(r *http.Request) (q string, after uint64, afterd string, page int, pq parsed, dedup bool, noexp bool) {
+func searchArgs(r *http.Request) (q string, after uint64, afterd string, page int, pq parsed, dedupMode string, noexp bool) {
 	q = r.URL.Query().Get("q")
 	after, _ = strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
 	afterd = r.URL.Query().Get("afterd")
@@ -1049,8 +1357,8 @@ func searchArgs(r *http.Request) (q string, after uint64, afterd string, page in
 	}
 	pq = parseQuery(q)
 	switch r.URL.Query().Get("dedup") {
-	case "1", "true", "on":
-		dedup = true
+	case "1", "true", "on", "pre", "dom":
+		dedupMode = r.URL.Query().Get("dedup")
 	}
 	// crt.sh-style exclude=expired, plus a short form for the UI checkbox
 	if r.URL.Query().Get("exclude") == "expired" {
@@ -1074,7 +1382,7 @@ type footData struct {
 	Page      int
 	PrevOK    bool
 	NextPage  int
-	Dedup     bool
+	Dedup     string
 	Noexp     bool
 	Names     bool
 }

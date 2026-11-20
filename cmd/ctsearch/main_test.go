@@ -201,6 +201,91 @@ func TestHlTermsAndText(t *testing.T) {
 	}
 }
 
+func TestParseQueryNewFilters(t *testing.T) {
+	cases := []struct {
+		q, kind, wantWhere string
+	}{
+		{"c:tw", "subject C", `upper(c) = ?`},
+		{"o:google", "subject O", `positionCaseInsensitive(o, ?) > 0`},
+		{"ou:pki", "subject OU", `positionCaseInsensitive(ou, ?) > 0`},
+		{"ca:", "CA certs", `basic_constraints = 'CA:TRUE'`},
+		{"ca:0", "not CA", `basic_constraints != 'CA:TRUE'`},
+		{"selfsigned:", "self-signed", `issuer != '' AND issuer = aggregated`},
+		{"wildcard:", "wildcard names", `domain LIKE '*%'`},
+		{"valid:", "currently valid", `not_before <= ? AND not_after >= ?`},
+	}
+	for _, c := range cases {
+		p := parseQuery(c.q)
+		if p.kind != c.kind || p.where != c.wantWhere {
+			t.Fatalf("%q: kind=%q where=%q", c.q, p.kind, p.where)
+		}
+	}
+}
+
+func TestParseQueryTimeSpec(t *testing.T) {
+	p := parseQuery("exp<30d")
+	if !strings.Contains(p.where, "not_after < ?") {
+		t.Fatalf("exp<30d where = %q", p.where)
+	}
+	p = parseQuery("nb>7d")
+	if !strings.Contains(p.where, "not_before > ?") {
+		t.Fatalf("nb>7d where = %q", p.where)
+	}
+	if op, ts, ok := timeSpec("<1735689600"); !ok || op != "<" || ts != 1735689600 {
+		t.Fatalf("epoch timespec = %q %d %v", op, ts, ok)
+	}
+	if _, _, ok := timeSpec("x30d"); ok {
+		t.Fatal("invalid timespec should fail")
+	}
+}
+
+func TestSplitTermsCompound(t *testing.T) {
+	cases := map[string][]string{
+		"a.com b.com":                  {"a.com", "b.com"},
+		`issuer:"Let's Encrypt" a.com`: {"issuer:Let's Encrypt", "a.com"},
+		"issuer:Let's Encrypt":         {"issuer:Let's Encrypt"},
+		"issuer:R11 github.com":        {"issuer:R11", "github.com"},
+		"o:Go Daddy a.com":             {"o:Go Daddy", "a.com"},
+	}
+	for in, want := range cases {
+		got := splitTerms(in)
+		if len(got) != len(want) {
+			t.Fatalf("%q -> %v, want %v", in, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%q -> %v, want %v", in, got, want)
+			}
+		}
+	}
+}
+
+func TestParseQueryCompound(t *testing.T) {
+	// domain + non-domain: dom index path survives, phase-2 is OR-domain AND-other
+	p := parseQuery("github.com issuer:encrypt")
+	if p.domwhere == "" {
+		t.Fatal("compound lost domwhere")
+	}
+	if !strings.Contains(p.where, "OR") || !strings.Contains(p.where, "issuer") {
+		t.Fatalf("compound where = %q", p.where)
+	}
+	// two domains: phase-1 intersects cert_index sets on certs_dom
+	p = parseQuery("a.com b.com")
+	if !strings.Contains(p.domwhere, "cert_index IN (SELECT") {
+		t.Fatalf("multi-domain domwhere = %q", p.domwhere)
+	}
+	// selective term makes compound single-phase
+	p = parseQuery("a.com fp:abc123")
+	if !p.single {
+		t.Fatal("fp: term should make compound single-phase")
+	}
+	// names: swallows its whole remainder before term splitting
+	p = parseQuery("names:a.com")
+	if !p.names {
+		t.Fatal("names: should still parse as names query")
+	}
+}
+
 func TestParseQuerySuffixCoversApex(t *testing.T) {
 	// %.github.com keeps the certs-side predicate for phase-2 row
 	// suppression AND gains the certs_dom range for phase-1.
